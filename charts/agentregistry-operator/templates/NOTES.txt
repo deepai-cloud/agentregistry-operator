@@ -1,0 +1,23 @@
+AgentRegistry operator is installed in namespace {{ .Release.Namespace }}.
+This release includes Metacontroller {{ (index .Subcharts "metacontroller").Chart.AppVersion }} and the AgentRegistry CRD.
+
+Check the controller pods:
+  kubectl get pods --namespace {{ .Release.Namespace }} --selector app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl rollout status deployment/{{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+Operator and gateway image: {{ include "agentregistry-operator.image" . }}
+The image must be accessible to nodes running both controller and registry pods.
+{{- if and (not .Values.image.digest) (eq .Values.image.tag "dev") }}
+The default dev image must be built and loaded into your cluster before pods can start.
+{{- end }}
+
+Next, create a registry namespace, authentication Secret, and an AgentRegistry
+resource using the repository quickstart and examples. Managed PostgreSQL needs
+a default StorageClass or an explicit spec.database.storageClassName.
+Inspect registry readiness with:
+  kubectl get agentregistries --all-namespaces
+
+Install only one release per cluster. Before uninstalling, delete all
+AgentRegistry resources and wait for their managed children to disappear.
+Helm retains the CRDs. Registry deletion retains database PVCs and user-created
+Secrets, but deletes generated database credentials; back them up before deletion.

@@ -1,0 +1,8 @@
+*
+!LICENSE
+!go.mod
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+**/*_test.go

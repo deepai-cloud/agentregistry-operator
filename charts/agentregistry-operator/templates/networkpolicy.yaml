@@ -1,0 +1,43 @@
+{{- $metacontroller := index .Subcharts "metacontroller" -}}
+{
+  "apiVersion": "networking.k8s.io/v1",
+  "kind": "NetworkPolicy",
+  "metadata": {
+    "name": {{ .Release.Name | quote }},
+    "labels": {{ include "agentregistry-operator.labels" . }},
+    "namespace": {{ .Release.Namespace | quote }}
+  },
+  "spec": {
+    "podSelector": {
+      "matchLabels": {
+        "app.kubernetes.io/name": "agentregistry-operator",
+        "app.kubernetes.io/instance": {{ .Release.Name | quote }}
+      }
+    },
+    "policyTypes": [
+      "Ingress",
+      "Egress"
+    ],
+    "ingress": [
+      {
+        "from": [
+          {
+            "podSelector": {
+              "matchLabels": {
+                "app.kubernetes.io/name": {{ include "metacontroller.name" $metacontroller | quote }},
+                "app.kubernetes.io/instance": {{ .Release.Name | quote }}
+              }
+            }
+          }
+        ],
+        "ports": [
+          {
+            "protocol": "TCP",
+            "port": 8080
+          }
+        ]
+      }
+    ],
+    "egress": []
+  }
+}

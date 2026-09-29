@@ -1,0 +1,42 @@
+# Published by the repository's release workflow for each version tag.
+# The same image runs the webhook and the gateway in every registry namespace.
+image:
+  repository: ghcr.io/deepai-cloud/agentregistry-operator
+  tag: v0.1.0
+  # Optional immutable digest, e.g. sha256:<64 hex characters>. Overrides tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Replicas of the stateless operator webhook; Metacontroller remains a singleton.
+replicaCount: 1
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+# The tested upstream chart is vendored under charts/ and installed in this release.
+# Keep its wildcard/aggregated RBAC disabled; values validation enforces this.
+# The operator chart supplies explicit permissions.
+# Shared informers still require cluster-wide reads (including
+# Secrets); related-resource selection limits webhook payloads, not cache access.
+metacontroller:
+  rbac:
+    create: false
+  replicas: 1
+  image:
+    tag: v4.17.2
+  # Names and service account settings also drive our binding and network policy.
+  nameOverride: ""
+  fullnameOverride: ""
+  # Must remain empty: both controllers use the Helm release namespace.
+  namespaceOverride: ""
+  serviceAccount:
+    create: true
+    name: ""

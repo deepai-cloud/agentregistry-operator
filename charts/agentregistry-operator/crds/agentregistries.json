@@ -1,0 +1,262 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "agentregistries.registry.deepai.cloud"
+  },
+  "spec": {
+    "group": "registry.deepai.cloud",
+    "scope": "Namespaced",
+    "names": {
+      "plural": "agentregistries",
+      "singular": "agentregistry",
+      "kind": "AgentRegistry",
+      "shortNames": [
+        "areg"
+      ]
+    },
+    "versions": [
+      {
+        "name": "v1alpha1",
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        },
+        "additionalPrinterColumns": [
+          {
+            "name": "Version",
+            "type": "string",
+            "jsonPath": ".spec.version"
+          },
+          {
+            "name": "Installed",
+            "type": "string",
+            "jsonPath": ".status.installedVersion"
+          },
+          {
+            "name": "Ready",
+            "type": "string",
+            "jsonPath": ".status.conditions[?(@.type==\"Ready\")].status"
+          },
+          {
+            "name": "Age",
+            "type": "date",
+            "jsonPath": ".metadata.creationTimestamp"
+          }
+        ],
+        "schema": {
+          "openAPIV3Schema": {
+            "type": "object",
+            "x-kubernetes-validations": [
+              {
+                "rule": "self.metadata.name.size() <= 63 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",
+                "message": "Name must be a DNS label beginning with a letter, at most 63 characters, suitable for the generated Service."
+              }
+            ],
+            "required": [
+              "spec"
+            ],
+            "properties": {
+              "apiVersion": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "spec": {
+                "type": "object",
+                "required": [
+                  "version",
+                  "authSecretName"
+                ],
+                "x-kubernetes-validations": [
+                  {
+                    "rule": "self.version == oldSelf.version || (oldSelf.version == '0.3.2' && self.version == '0.3.3')",
+                    "message": "Only upgrades from 0.3.2 to 0.3.3 are supported; downgrades are forbidden."
+                  },
+                  {
+                    "rule": "has(self.database) == has(oldSelf.database) && (!has(self.database) || self.database == oldSelf.database)",
+                    "message": "Database configuration is immutable; migrate or restore into a new installation to change database mode or storage settings."
+                  }
+                ],
+                "properties": {
+                  "version": {
+                    "type": "string",
+                    "enum": [
+                      "0.3.2",
+                      "0.3.3"
+                    ]
+                  },
+                  "database": {
+                    "type": "object",
+                    "properties": {
+                      "secretName": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "host": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 253,
+                        "description": "One namespace-local Service FQDN or literal IP; webhook validates it against the parent namespace and Secret URL."
+                      },
+                      "storage": {
+                        "type": "string",
+                        "pattern": "^[1-9][0-9]*(Mi|Gi)$",
+                        "maxLength": 16,
+                        "description": "Managed PostgreSQL volume size, default 1Gi. Immutable after creation."
+                      },
+                      "storageClassName": {
+                        "type": "string",
+                        "maxLength": 253,
+                        "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+                        "description": "StorageClass for managed PostgreSQL. Omit to use the cluster default; empty string disables dynamic class selection."
+                      }
+                    },
+                    "description": "Omit for operator-managed PostgreSQL. Set host and secretName together to use an existing external database.",
+                    "x-kubernetes-validations": [
+                      {
+                        "rule": "has(self.host) == has(self.secretName)",
+                        "message": "External database requires both host and secretName."
+                      },
+                      {
+                        "rule": "!has(self.host) || (!has(self.storage) && !has(self.storageClassName))",
+                        "message": "Storage settings apply only to managed PostgreSQL."
+                      }
+                    ]
+                  },
+                  "authSecretName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 63,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  },
+                  "resources": {
+                    "type": "object",
+                    "properties": {
+                      "requests": {
+                        "type": "object",
+                        "properties": {
+                          "cpu": {
+                            "type": "string",
+                            "pattern": "^([0-9]+m|[0-9]+(\\.[0-9]+)?)$"
+                          },
+                          "memory": {
+                            "type": "string",
+                            "pattern": "^[1-9][0-9]*(Mi|Gi)$"
+                          }
+                        }
+                      },
+                      "limits": {
+                        "type": "object",
+                        "properties": {
+                          "cpu": {
+                            "type": "string",
+                            "pattern": "^([0-9]+m|[0-9]+(\\.[0-9]+)?)$"
+                          },
+                          "memory": {
+                            "type": "string",
+                            "pattern": "^[1-9][0-9]*(Mi|Gi)$"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "exposure": {
+                    "type": "object",
+                    "required": [
+                      "hostname",
+                      "tlsSecretName"
+                    ],
+                    "properties": {
+                      "hostname": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 253,
+                        "pattern": "^([a-z0-9]([a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                      },
+                      "tlsSecretName": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      }
+                    }
+                  }
+                }
+              },
+              "status": {
+                "type": "object",
+                "properties": {
+                  "observedGeneration": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "installedVersion": {
+                    "type": "string"
+                  },
+                  "endpoints": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "conditions": {
+                    "type": "array",
+                    "x-kubernetes-list-type": "map",
+                    "x-kubernetes-list-map-keys": [
+                      "type"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "type",
+                        "status",
+                        "reason",
+                        "message",
+                        "observedGeneration"
+                      ],
+                      "properties": {
+                        "type": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "True",
+                            "False",
+                            "Unknown"
+                          ]
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "observedGeneration": {
+                          "type": "integer",
+                          "format": "int64"
+                        },
+                        "lastTransitionTime": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

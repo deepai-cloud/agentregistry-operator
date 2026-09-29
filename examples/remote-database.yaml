@@ -1,0 +1,16 @@
+# Replace this documentation-only address with your database's actual literal IP.
+# Its certificate must include that IP in a Subject Alternative Name.
+apiVersion: registry.deepai.cloud/v1alpha1
+kind: AgentRegistry
+metadata:
+  name: catalog
+  namespace: tenant-a
+spec:
+  version: "0.3.3"
+  database:
+    host: "192.0.2.10"
+    secretName: registry-database
+  authSecretName: registry-auth
+  exposure:
+    hostname: catalog.example.com
+    tlsSecretName: registry-tls

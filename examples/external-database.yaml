@@ -1,0 +1,9 @@
+# Bring your own PostgreSQL; see docs/creating-a-registry.md.
+apiVersion: registry.deepai.cloud/v1alpha1
+kind: AgentRegistry
+metadata:
+  name: catalog
+  namespace: tenant-a
+spec:
+  version: "0.3.3"
+  authSecretName: registry-auth

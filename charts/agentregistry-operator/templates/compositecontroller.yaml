@@ -1,0 +1,78 @@
+{
+  "apiVersion": "metacontroller.k8s.io/v1alpha1",
+  "kind": "CompositeController",
+  "metadata": {
+    "name": {{ .Release.Name | quote }},
+    "labels": {{ include "agentregistry-operator.labels" . }}
+  },
+  "spec": {
+    "generateSelector": true,
+    "resyncPeriodSeconds": 30,
+    "parentResource": {
+      "apiVersion": "registry.deepai.cloud/v1alpha1",
+      "resource": "agentregistries",
+      "ignoreStatusChanges": true
+    },
+    "childResources": [
+      {
+        "apiVersion": "apps/v1",
+        "resource": "statefulsets",
+        "updateStrategy": {"method": "InPlace"}
+      },
+      {
+        "apiVersion": "v1",
+        "resource": "secrets",
+        "updateStrategy": {"method": "InPlace"}
+      },
+      {
+        "apiVersion": "v1",
+        "resource": "configmaps",
+        "updateStrategy": {"method": "InPlace"}
+      },
+      {
+        "apiVersion": "apps/v1",
+        "resource": "deployments",
+        "updateStrategy": {
+          "method": "InPlace"
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "resource": "services",
+        "updateStrategy": {
+          "method": "InPlace"
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "resource": "serviceaccounts",
+        "updateStrategy": {
+          "method": "InPlace"
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "resource": "networkpolicies",
+        "updateStrategy": {
+          "method": "InPlace"
+        }
+      }
+    ],
+    "hooks": {
+      "sync": {
+        "version": "v1",
+        "webhook": {
+          "url": {{ printf "http://%s.%s.svc.cluster.local:8080/sync" .Release.Name .Release.Namespace | quote }},
+          "timeout": "10s"
+        }
+      },
+      "customize": {
+        "version": "v1",
+        "webhook": {
+          "url": {{ printf "http://%s.%s.svc.cluster.local:8080/customize" .Release.Name .Release.Namespace | quote }},
+          "timeout": "10s"
+        }
+      }
+    }
+  }
+}

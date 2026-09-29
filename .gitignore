@@ -1,0 +1,8 @@
+.cache/
+.local/
+bin/
+dist/
+coverage.out
+evidence/e2e-*/
+__pycache__/
+*.pyc

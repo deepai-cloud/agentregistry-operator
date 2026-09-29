@@ -1,0 +1,96 @@
+# Disposable demo only: data is lost when the PostgreSQL pod is replaced.
+# Generate registry-postgres with create-secrets.py --external-database first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: tenant-a
+spec:
+  selector:
+    registry.deepai.cloud/database: catalog
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: tenant-a
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      registry.deepai.cloud/database: catalog
+  template:
+    metadata:
+      labels:
+        registry.deepai.cloud/database: catalog
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:0.8.2-pg17@sha256:feb68f4f15446397d8cac7f4fe48fe4586de83160d1fc48b46283312d1a33966
+          env:
+            - name: POSTGRES_DB
+              value: registry
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: registry-postgres
+                  key: postgres-password
+          ports:
+            - name: postgres
+              containerPort: 5432
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "registry"]
+            periodSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: init
+          secret:
+            secretName: registry-postgres
+            items:
+              - key: init.sql
+                path: init.sql
+---
+# Only registry pods in this namespace can connect. Database roles enforce
+# authorization between registries if you add more than one in this namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-registries
+  namespace: tenant-a
+spec:
+  podSelector:
+    matchLabels:
+      registry.deepai.cloud/database: catalog
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: registry.deepai.cloud/instance
+                operator: Exists
+      ports:
+        - protocol: TCP
+          port: 5432

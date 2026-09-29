@@ -1,0 +1,18 @@
+apiVersion: registry.deepai.cloud/v1alpha1
+kind: AgentRegistry
+metadata:
+  name: catalog
+  namespace: tenant-a
+spec:
+  version: "0.3.3"
+  authSecretName: registry-auth
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  exposure:
+    hostname: catalog.example.com
+    tlsSecretName: registry-tls

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: agentregistry-operator
+description: Install and manage namespaced Agent Registry instances with a bundled Metacontroller
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/deepai-cloud/agentregistry-operator
+sources:
+  - https://github.com/deepai-cloud/agentregistry-operator
+annotations:
+  org.opencontainers.image.licenses: MIT
+kubeVersion: ">=1.30.0-0"
+keywords:
+  - agentregistry
+  - operator
+  - metacontroller
+dependencies:
+  - name: metacontroller-helm
+    alias: metacontroller
+    version: "4.17.2"
+    repository: "oci://ghcr.io/metacontroller"

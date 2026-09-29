@@ -1,0 +1,13 @@
+# Choose database storage before creation; database settings are immutable.
+apiVersion: registry.deepai.cloud/v1alpha1
+kind: AgentRegistry
+metadata:
+  name: catalog
+  namespace: tenant-a
+spec:
+  version: "0.3.3"
+  authSecretName: registry-auth
+  database:
+    storage: "10Gi"
+    # Omit to use the default StorageClass, or name your own class here:
+    # storageClassName: your-storage-class

@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentRegistry operator Helm values",
+  "type": "object",
+  "required": ["image", "replicaCount", "metacontroller"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag", "digest", "pullPolicy"],
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Image repository accessible to both controller and registry pods; omit tag and digest."
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^$|^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$",
+          "description": "Immutable image digest; takes precedence over tag."
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      },
+      "anyOf": [
+        {"properties": {"tag": {"minLength": 1}}},
+        {"properties": {"digest": {"minLength": 1}}}
+      ]
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of stateless webhook replicas."
+    },
+    "resources": {"type": "object"},
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "tolerations": {"type": "array", "items": {"type": "object"}},
+    "affinity": {"type": "object"},
+    "metacontroller": {
+      "type": "object",
+      "required": ["rbac", "replicas", "serviceAccount"],
+      "properties": {
+        "namespaceOverride": {
+          "type": "string",
+          "enum": [""],
+          "description": "Must remain empty: Metacontroller and the webhook share the Helm release namespace."
+        },
+        "rbac": {
+          "type": "object",
+          "required": ["create"],
+          "properties": {
+            "create": {
+              "type": "boolean",
+              "enum": [false],
+              "description": "Must remain false: this chart supplies explicit RBAC instead of upstream wildcard grants."
+            }
+          }
+        },
+        "replicas": {
+          "type": "integer",
+          "enum": [1],
+          "description": "This distribution supports one Metacontroller replica and does not grant leader-election permissions."
+        },
+        "serviceAccount": {
+          "type": "object",
+          "required": ["create", "name"],
+          "properties": {
+            "create": {"type": "boolean"},
+            "name": {"type": "string"}
+          },
+          "if": {"properties": {"create": {"const": false}}},
+          "then": {"properties": {"name": {"minLength": 1}}}
+        }
+      }
+    }
+  }
+}
