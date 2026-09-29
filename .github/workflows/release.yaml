@@ -2,14 +2,18 @@ name: release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Independent main builds must not replace each other's pending publish runs.
+  group: release-${{ github.ref_type == 'tag' && github.ref || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -20,6 +24,9 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       image: ${{ steps.release.outputs.image }}
       chart_registry: ${{ steps.release.outputs.chart_registry }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      snapshot: ${{ steps.release.outputs.snapshot }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -31,24 +38,7 @@ jobs:
           version: v3.17.3
       - name: Derive release coordinates
         id: release
-        shell: bash
-        run: |
-          # deepai-cloud/agentregistry-operator publishes the image at
-          # ghcr.io/deepai-cloud/agentregistry-operator and the chart under /charts.
-          python3 - <<'PY'
-          import os
-          import runpy
-
-          package = runpy.run_path("scripts/package.py")
-          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          if not package["VERSION_PATTERN"].fullmatch(version):
-              raise SystemExit("Release tags must be vMAJOR.MINOR.PATCH with an optional SemVer prerelease")
-          PY
-          {
-            printf 'version=%s\n' "${GITHUB_REF_NAME#v}"
-            printf 'image=ghcr.io/%s:%s\n' "${GITHUB_REPOSITORY,,}" "$GITHUB_REF_NAME"
-            printf 'chart_registry=oci://ghcr.io/%s/charts\n' "${GITHUB_REPOSITORY_OWNER,,}"
-          } >> "$GITHUB_OUTPUT"
+        run: python3 scripts/release-coordinates.py
       - name: Verify code, chart, and examples
         run: make verify
       - name: Build versioned installable packages
@@ -61,11 +51,13 @@ jobs:
         with:
           name: release-packages
           path: dist/*
+          overwrite: true
           if-no-files-found: error
           retention-days: 14
 
   publish:
     needs: verify
+    if: github.repository == 'deepai-cloud/agentregistry-operator'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -103,7 +95,7 @@ jobs:
             org.opencontainers.image.description=Kubernetes operator and gateway for AgentRegistry
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -124,6 +116,9 @@ jobs:
           IMAGE: ${{ needs.verify.outputs.image }}
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
           CHART_REGISTRY: ${{ needs.verify.outputs.chart_registry }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          SNAPSHOT: ${{ needs.verify.outputs.snapshot }}
         shell: bash
         run: |
           # Markdown code spans use literal backticks.
@@ -132,17 +127,38 @@ jobs:
             printf 'Operator and gateway image: `%s`\n\n' "$IMAGE"
             printf 'Image manifest digest: `%s`\n\n' "$IMAGE_DIGEST"
             printf 'Helm chart: `%s/agentregistry-operator`, version `%s`.\n\n' "$CHART_REGISTRY" "$VERSION"
-            printf 'The chart includes the release image and bundled Metacontroller; no local image build is required.\n\n'
-            printf 'See the [installation guide](%s/%s/blob/%s/docs/installation.md).\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+            printf 'The chart selects the published image and bundles Metacontroller; no local image build is required.\n\n'
+            printf 'Downloads include the chart, source/examples bundle, Linux amd64 and arm64 operator/gateway binaries, and SHA256SUMS.\n\n'
+            printf 'Source commit: `%s`\n\n' "$GITHUB_SHA"
+            printf 'See the [installation guide](%s/%s/blob/%s/docs/installation.md).\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA"
           } > "$RUNNER_TEMP/release-notes.md"
-          release_flags=()
-          if [[ "$VERSION" == *-* ]]; then
-            release_flags+=(--prerelease)
-          fi
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
-            "${release_flags[@]}" \
-            "dist/agentregistry-operator-$VERSION.tgz" \
-            "dist/agentregistry-operator-$VERSION-bundle.tar.gz" \
+          assets=(
+            "dist/agentregistry-operator-$VERSION.tgz"
+            "dist/agentregistry-operator-$VERSION-bundle.tar.gz"
+            "dist/agentregistry-operator-$VERSION-linux-amd64.tar.gz"
+            "dist/agentregistry-operator-$VERSION-linux-arm64.tar.gz"
             dist/SHA256SUMS
+          )
+          release_flags=()
+          if [[ "$PRERELEASE" == true ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          # Development tags are created at the exact tested commit. Versioned
+          # releases require the tag which triggered the workflow to exist.
+          if [[ "$SNAPSHOT" != true ]]; then
+            release_flags+=(--verify-tag)
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # A rerun can finish an interrupted upload without creating a duplicate.
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            edit_flags=(--draft=false --prerelease="$PRERELEASE")
+            if [[ "$PRERELEASE" == true ]]; then
+              edit_flags+=(--latest=false)
+            fi
+            gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md" "${edit_flags[@]}"
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" --title "$RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              "${release_flags[@]}" "${assets[@]}"
+          fi

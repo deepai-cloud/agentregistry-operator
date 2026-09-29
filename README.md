@@ -43,9 +43,13 @@ Choose a published version from
 [GitHub releases](https://github.com/deepai-cloud/agentregistry-operator/releases)
 and install its OCI chart. The chart selects the matching GHCR operator/gateway
 image, so installation needs no source checkout or local build.
+GitHub Actions publishes development prereleases on every push to `main` and
+stable or named prereleases on version tag pushes. Each release also offers a
+downloadable chart, source/examples bundle, Linux amd64/arm64 operator and gateway
+executables, and checksums.
 
 ```sh
-export OPERATOR_VERSION='<VERSION>' # Release version without the leading v
+export OPERATOR_VERSION='<VERSION>' # Exact chart version from the release notes
 export KUBE_CONTEXT=your-cluster-context
 
 helm upgrade --install agentregistry-operator \
@@ -57,8 +61,9 @@ helm upgrade --install agentregistry-operator \
 ```
 
 The [installation guide](docs/installation.md) covers release availability, GHCR
-access and verification. Before first use, a maintainer must publish a version and
-enable public access to both GHCR packages. Install one operator release per
+access and verification. Before first use, a maintainer must complete the
+[publishing setup](docs/releases.md#publishing-setup) and enable public access to
+both GHCR packages after a successful publishing run. Install one operator release per
 cluster. Kubernetes 1.30+, `cluster.local` DNS and enforced ingress/egress
 NetworkPolicies are required. Metacontroller runs alongside the webhook in the
 same namespace; CRDs and controller permissions remain cluster-scoped. Managed PostgreSQL
@@ -129,13 +134,16 @@ are needed for the demo.
 ```sh
 make help       # available commands
 make verify     # race tests, vet, builds, chart contracts and documentation links
-make package    # Helm chart, source/examples bundle and SHA256SUMS in dist/
+make package    # chart, source bundle, Linux executables and SHA256SUMS in dist/
 make image      # combined operator/gateway container
 ```
 
 Packaging is local. The [release workflow](.github/workflows/release.yaml) publishes
-versioned multi-platform images, an OCI Helm chart and downloadable bundles when
-a maintainer pushes a release tag. Nothing is published by `make package`.
+versioned multi-platform images, an OCI Helm chart and downloadable archives on
+pushes to `main`, manual runs on `main`, and version tag pushes. Feature branches
+and pull requests run verification without publishing. Nothing is published by
+`make package`. See [packaging and releases](docs/releases.md) for versions,
+downloadable artifacts and setup.
 
 ## License
 

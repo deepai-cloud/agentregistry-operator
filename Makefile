@@ -19,6 +19,7 @@ help: ## Show available commands
 verify: test build chart ## Run Go tests, vet, chart checks, and documentation checks
 	@test -z "$$(gofmt -l cmd internal)" || { echo 'Run gofmt -w cmd internal'; exit 1; }
 	go vet ./...
+	python3 scripts/test-release-coordinates.py
 	python3 scripts/verify-docs.py
 	python3 -m py_compile scripts/*.py examples/local/*.py
 	bash -n scripts/demo.sh
@@ -43,8 +44,8 @@ chart: ## Lint and verify the bundled Helm chart without a cluster
 	python3 scripts/fetch-metacontroller.py --verify
 	python3 scripts/verify-chart.py
 
-package: chart ## Build chart, source/example bundle, and checksums under dist/
-	python3 scripts/package.py $(if $(VERSION),--version "$(VERSION)") --image "$(IMAGE)"
+package: chart ## Build chart, source bundle, Linux binaries, and checksums under dist/
+	python3 scripts/package.py $(if $(VERSION),--version "$(VERSION)") --image "$(IMAGE)" --binaries
 
 image: ## Build the container image (override IMAGE to tag it)
 	docker build --tag "$(IMAGE)" .

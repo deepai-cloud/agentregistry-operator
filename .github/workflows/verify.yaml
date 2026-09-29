@@ -1,6 +1,9 @@
 name: verify
 on:
   push:
+    # main and version tags run the release workflow's verification before publishing.
+    branches-ignore:
+      - main
   pull_request:
 
 permissions:

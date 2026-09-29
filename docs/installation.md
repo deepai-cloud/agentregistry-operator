@@ -34,17 +34,24 @@ Metacontroller.
 Choose an available version from the repository's
 [releases](https://github.com/deepai-cloud/agentregistry-operator/releases). The
 [release workflow](../.github/workflows/release.yaml) builds and publishes these
-artifacts when a maintainer pushes a version tag:
+artifacts automatically for pushes to `main` and version tags:
 
 | Artifact | Location |
 | --- | --- |
 | Operator and gateway image | `ghcr.io/deepai-cloud/agentregistry-operator:v<VERSION>` |
 | Helm chart | `oci://ghcr.io/deepai-cloud/charts/agentregistry-operator`, version `<VERSION>` |
-| Chart archive, source bundle and checksums | GitHub release assets |
+| Chart archive, source/examples bundle, Linux amd64/arm64 executable archives and checksums | GitHub release assets |
+
+Main builds appear as development prereleases and need no local build or version
+tag. Their package versions look like
+`0.1.0-dev.<run-id>.<attempt>.g<12-character-sha>`. Copy the exact version from the
+release notes; its `dev-...` GitHub release tag is not the chart version. Stable
+versions come from tags such as `v0.1.0`; tags such as `v0.2.0-rc.1` publish named
+prereleases. See [automatic publishing](releases.md#automatic-publishing).
 
 The workflow must have completed for the selected version. Before the first
 login-free installation, a maintainer must make both GHCR packages public and
-verify anonymous pulls; see [publishing a version](releases.md#publish-a-version).
+verify anonymous pulls; see [publishing setup](releases.md#publishing-setup).
 The existence of this source checkout does not imply that a release is published.
 
 The versioned chart already selects its matching operator image, shared by the
@@ -55,9 +62,9 @@ published manifest's `sha256:...` digest; it takes precedence over the image tag
 
 ## 2. Select a context and install the chart
 
-Set `OPERATOR_VERSION` to the selected release version without the leading `v`,
-for example `0.1.0` once that release has been published. Set the context
-deliberately, then review the destination:
+Set `OPERATOR_VERSION` to the exact chart version from the selected release notes,
+for example `0.1.0` once that release has been published, or the complete `-dev...`
+version for a main build. Set the context deliberately, then review the destination:
 
 ```sh
 export OPERATOR_VERSION='<VERSION>'
@@ -71,6 +78,13 @@ helm upgrade --install agentregistry-operator \
   --namespace agentregistry-system --create-namespace \
   --wait --timeout 5m
 ```
+
+To install a downloaded release chart instead, replace the OCI chart URL and
+`--version` argument with the path to `agentregistry-operator-<VERSION>.tgz`.
+The source bundle also includes this chart archive. Both installation methods pull
+the operator image from GHCR; release downloads do not include an offline container
+image archive. The separate executable archives contain Linux `operator` and
+`gateway` binaries for users who need them outside the chart installation.
 
 The tested Metacontroller 4.17.2 chart is vendored in
 `charts/agentregistry-operator/charts/` with a verified archive checksum; its runtime
