@@ -30,9 +30,10 @@ func Sync(r Request, c Config) (Response, error) {
 	p := r.Parent
 	managed := managedDatabase(p.Spec.Database)
 	var dbSecret Object
+	var dbSecretPending bool
 	if managed {
 		var err error
-		dbSecret, err = databaseSecret(r)
+		dbSecret, dbSecretPending, err = databaseSecret(r)
 		if err != nil {
 			return Response{}, err
 		}
@@ -55,20 +56,18 @@ func Sync(r Request, c Config) (Response, error) {
 		dependencyRequest.Related[key] = copyGroup
 	}
 	if dbSecret != nil {
-		dependencySecret := Object{}
-		for key, value := range dbSecret {
-			dependencySecret[key] = value
-		}
-		// A content fingerprint is stable across observation through both caches.
-		dependencySecret["metadata"] = Object{"name": databaseName(p), "namespace": p.Metadata.Namespace, "uid": hash(dbSecret["data"]), "resourceVersion": "managed"}
-		dependencyRequest.Related["generated-database"] = map[string]Object{databaseName(p): dependencySecret}
+		dependencyRequest.Related["generated-database"] = map[string]Object{databaseName(p): dbSecret}
 	}
 	depsOK, message, tokens := dependencies(dependencyRequest)
 	if managed {
-		if dbSecret == nil {
-			depsOK, message = false, "Managed database credentials are missing for existing storage; restore the database Secret from backup"
+		if dbSecret == nil && dbSecretPending {
+			depsOK, message = false, "Waiting for the terminating managed database Secret to disappear before provisioning PostgreSQL"
+		} else if dbSecret == nil {
+			depsOK, message = false, "Managed database credentials are unavailable for existing storage; restore the original database Secret from backup"
 		} else if !validDatabaseSecret(dbSecret, p) {
 			depsOK, message = false, "Managed database Secret is invalid; restore its original credentials from backup"
+		} else if dbSecretPending {
+			depsOK, message = false, "Waiting for managed database credentials to be persisted before provisioning PostgreSQL"
 		}
 	}
 	replicas := 1
@@ -92,21 +91,40 @@ func Sync(r Request, c Config) (Response, error) {
 		return Object{"name": name, "valueFrom": Object{"secretKeyRef": Object{"name": secret, "key": key}}}
 	}
 	res, _ := resources(p.Spec.Resources)
+	// Use effective defaults and quantities in the rollout fingerprint so
+	// equivalent resource edits preserve the running pod.
+	p.Spec.Resources = res
 	registry := Object{"name": "registry", "image": images[p.Spec.Version], "imagePullPolicy": "IfNotPresent", "securityContext": security, "resources": res, "env": []Object{
 		env("AGENT_REGISTRY_SERVER_ADDRESS", "127.0.0.1:8080"), env("AGENT_REGISTRY_MCP_PORT", "31313"), env("AGENT_REGISTRY_ENABLE_ANONYMOUS_AUTH", "true"), env("AGENT_REGISTRY_ENABLE_REGISTRY_VALIDATION", "false"), env("AGENT_REGISTRY_DISABLE_BUILTIN_SEED", "true"), env("AGENT_REGISTRY_DATABASE_VECTOR_ENABLED", "false"), env("AGENT_REGISTRY_EMBEDDINGS_ENABLED", "false"), secretEnv("AGENT_REGISTRY_DATABASE_URL", p.Spec.Database.SecretName, "url"), secretEnv("AGENT_REGISTRY_JWT_PRIVATE_KEY", p.Spec.AuthSecretName, "jwt-key")}, "volumeMounts": []Object{{"name": "tmp", "mountPath": "/tmp"}, {"name": "database", "mountPath": "/database", "readOnly": true}}}
+	// Both pinned registry images include curl. Exec reaches the pod's loopback
+	// listener; a kubelet HTTP probe would connect from outside the pod. This
+	// static health endpoint stays live through database outages, while gateway
+	// readiness checks the database and MCP. Disable curl config and proxy use.
+	registryHealth := Object{"command": []string{"/usr/bin/curl", "-q", "--fail", "--silent", "--show-error", "--max-time", "2", "--noproxy", "*", "--output", "/dev/null", "http://127.0.0.1:8080/v0/health"}}
+	registry["startupProbe"] = Object{"exec": registryHealth, "periodSeconds": 5, "timeoutSeconds": 3, "failureThreshold": 120}
+	registry["livenessProbe"] = Object{"exec": registryHealth, "periodSeconds": 10, "timeoutSeconds": 3, "failureThreshold": 3}
 	gatewayEnv := []Object{env("AUTH_DIR", "/auth"), env("LISTEN_ADDRESS", ":8443"), env("HEALTH_ADDRESS", ":9090")}
 	mounts := []Object{{"name": "auth", "mountPath": "/auth", "readOnly": true}}
-	volumes := []Object{{"name": "tmp", "emptyDir": Object{"sizeLimit": "64Mi"}}, {"name": "database", "secret": Object{"secretName": p.Spec.Database.SecretName}}, {"name": "auth", "secret": Object{"secretName": p.Spec.AuthSecretName}}}
-	if managed {
-		// The bootstrap superuser password must never be mounted into the app.
-		volumes[1]["secret"] = Object{"secretName": p.Spec.Database.SecretName, "items": []Object{{"key": "url", "path": "url"}}}
+	// A single Secret can serve multiple purposes. Project only the files
+	// meant for each container, even when the source names are identical.
+	databaseKeys := []string{"url"}
+	if !managed {
+		data := object(relatedSecret(r, p.Spec.Database.SecretName)["data"])
+		if _, present := data["ca.crt"]; present {
+			databaseKeys = append(databaseKeys, "ca.crt")
+		}
+	}
+	volumes := []Object{
+		{"name": "tmp", "emptyDir": Object{"sizeLimit": "64Mi"}},
+		secretVolume("database", p.Spec.Database.SecretName, databaseKeys...),
+		secretVolume("auth", p.Spec.AuthSecretName, "username", "password"),
 	}
 	serviceType, port, scheme, host := "ClusterIP", 8080, "http", p.Metadata.Name+"."+p.Metadata.Namespace+".svc.cluster.local:8080"
 	if p.Spec.Exposure != nil {
 		serviceType, port, scheme, host = "LoadBalancer", 443, "https", p.Spec.Exposure.Hostname
 		gatewayEnv = append(gatewayEnv, env("TLS_CERT_FILE", "/tls/tls.crt"), env("TLS_KEY_FILE", "/tls/tls.key"))
 		mounts = append(mounts, Object{"name": "tls", "mountPath": "/tls", "readOnly": true})
-		volumes = append(volumes, Object{"name": "tls", "secret": Object{"secretName": p.Spec.Exposure.TLSSecretName}})
+		volumes = append(volumes, secretVolume("tls", p.Spec.Exposure.TLSSecretName, "tls.crt", "tls.key"))
 	}
 	probe := func(path string) Object {
 		return Object{"httpGet": Object{"path": path, "port": 9090}, "periodSeconds": 5, "timeoutSeconds": 4, "failureThreshold": 2}
@@ -118,7 +136,7 @@ func Sync(r Request, c Config) (Response, error) {
 	network := makeObject("networking.k8s.io/v1", "NetworkPolicy", networkPolicy(p, selector))
 	children := []Object{sa, network, service, deployment}
 	if managed {
-		children = append(children, databaseChildren(r.Parent, dbSecret)...)
+		children = append(children, databaseChildren(r.Parent, dbSecret, dbSecretPending)...)
 	}
 	ready := depsOK && observedCurrent(r, children) && observedHealthy(r, deployment) && (!managed || databaseHealthy(r))
 	readyCondition := Condition{Type: "Ready", Status: "False", Reason: "Progressing", Message: "Waiting for current managed resources and registry rollout with database/MCP readiness; inspect children and pod events", ObservedGeneration: p.Metadata.Generation}
@@ -134,6 +152,9 @@ func Sync(r Request, c Config) (Response, error) {
 		installed = p.Spec.Version
 	}
 	dc := Condition{Type: "DependenciesReady", Status: "False", Reason: "InvalidOrMissingSecret", Message: message, ObservedGeneration: p.Metadata.Generation}
+	if dbSecretPending {
+		dc.Reason = "Provisioning"
+	}
 	if depsOK {
 		dc.Status = "True"
 		dc.Reason = "Resolved"
@@ -141,6 +162,15 @@ func Sync(r Request, c Config) (Response, error) {
 	base := scheme + "://" + host
 	return Response{Children: children, Status: Status{ObservedGeneration: p.Metadata.Generation, InstalledVersion: installed, Endpoints: map[string]string{"ui": base + "/", "api": base + "/v0", "mcp": base + "/mcp"}, Conditions: []Condition{dc, readyCondition}}, ResyncAfterSeconds: 10}, nil
 }
+
+func secretVolume(name, secret string, keys ...string) Object {
+	items := make([]Object, 0, len(keys))
+	for _, key := range keys {
+		items = append(items, Object{"key": key, "path": key})
+	}
+	return Object{"name": name, "secret": Object{"secretName": secret, "items": items}}
+}
+
 func networkPolicy(p Parent, selector Object) Object {
 	// A podSelector without namespaceSelector is scoped to this policy's namespace.
 	ingress := Object{"ports": []Object{{"protocol": "TCP", "port": 8443}}, "from": []Object{{"podSelector": Object{}}}}
@@ -162,18 +192,36 @@ func networkPolicy(p Parent, selector Object) Object {
 }
 
 func observedCurrent(r Request, desired []Object) bool {
+nextChild:
 	for _, child := range desired {
-		found := false
+		want := object(child["metadata"])
 		for _, group := range r.Children {
 			for _, observed := range group {
-				if object(observed["metadata"])["deletionTimestamp"] == nil && contains(observed, child) {
-					found = true
+				// Compare full JSON only for the same Kubernetes resource.
+				if observed["kind"] != child["kind"] || observed["apiVersion"] != child["apiVersion"] {
+					continue
 				}
+				got := object(observed["metadata"])
+				if got["name"] != want["name"] || got["namespace"] != want["namespace"] || got["deletionTimestamp"] != nil {
+					continue
+				}
+				if !contains(observed, child) {
+					continue
+				}
+				// Service selectors have no API defaults. Extra labels change
+				// routing, so require the reverse subset check as well.
+				if child["kind"] == "Service" && !contains(object(child["spec"])["selector"], object(observed["spec"])["selector"]) {
+					continue
+				}
+				// NetworkPolicy defaults (policyTypes and port protocols) are explicit.
+				// Extra spec fields can widen access or stop selecting owned pods.
+				if child["kind"] == "NetworkPolicy" && !contains(child["spec"], observed["spec"]) {
+					continue
+				}
+				continue nextChild
 			}
 		}
-		if !found {
-			return false
-		}
+		return false
 	}
 	return true
 }

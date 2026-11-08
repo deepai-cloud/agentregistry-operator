@@ -1,0 +1,53 @@
+{{/* The release names the webhook Service, which requires a DNS1035 label. */}}
+{{- if not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" .Release.Name) -}}
+{{- fail (printf "Helm release name must be a lowercase DNS label beginning with a letter because it names the webhook Service (got %q); choose a name such as registry-1" .Release.Name) -}}
+{{- end -}}
+{{/* Compare resolved upstream names so generated names and trimmed overrides are checked too. */}}
+{{- $metacontroller := index .Subcharts "metacontroller" -}}
+{{- $fullname := include "metacontroller.fullname" $metacontroller -}}
+{{/* StatefulSet assigns <name>-0 to pod.spec.hostname, a 63-character DNS label. */}}
+{{- if or (gt (len $fullname) 61) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $fullname)) -}}
+{{- fail (printf "Metacontroller StatefulSet name must be a DNS label of at most 61 characters (resolved to %q); set metacontroller.fullnameOverride to a shorter lowercase name so the pod's -0 suffix fits the hostname limit" $fullname) -}}
+{{- end -}}
+{{/* fullnameOverride does not replace the separate application name used in labels. */}}
+{{- $name := include "metacontroller.name" $metacontroller -}}
+{{- if or (gt (len $name) 63) (not (regexMatch "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" $name)) -}}
+{{- fail (printf "Metacontroller name label must be a nonempty Kubernetes label value (resolved to %q); set metacontroller.nameOverride to a name beginning and ending with an alphanumeric character, with only letters, digits, hyphens, underscores or dots in between" $name) -}}
+{{- end -}}
+{{/* The bundled chart emits this label unquoted; validate its actual YAML type. */}}
+{{- $selectorLabels := include "metacontroller.selectorLabels" $metacontroller | fromYaml -}}
+{{- if not (kindIs "string" (index $selectorLabels "app.kubernetes.io/name")) -}}
+{{- fail (printf "Metacontroller name label must remain a string in the bundled chart YAML (resolved to %q); set metacontroller.nameOverride to a name such as controller-1 instead of a YAML number, boolean or null" $name) -}}
+{{- end -}}
+{{- if not (kindIs "string" (index $selectorLabels "app.kubernetes.io/instance")) -}}
+{{- fail (printf "Helm release name label must remain a string in the bundled chart YAML (got %q); choose a release name such as registry-1 instead of a YAML boolean or null" .Release.Name) -}}
+{{- end -}}
+{{- if eq $name "agentregistry-operator" -}}
+{{- fail "Metacontroller pod selectors must differ from the webhook; set metacontroller.nameOverride to a name other than agentregistry-operator" -}}
+{{- end -}}
+{{- $account := include "metacontroller.serviceAccountName" $metacontroller -}}
+{{- if or (gt (len $account) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $account)) -}}
+{{- fail (printf "Metacontroller service account name must be a lowercase DNS subdomain of at most 253 characters (resolved to %q); set metacontroller.serviceAccount.name to a valid name such as controller-identity" $account) -}}
+{{- end -}}
+{{/* These upstream fields are unquoted even when --set-string supplies their values. */}}
+{{- range $field := list
+  (dict "name" "Metacontroller StatefulSet name" "value" $fullname "hint" "set metacontroller.fullnameOverride to controller-1")
+  (dict "name" "Metacontroller service account name" "value" $account "hint" "set metacontroller.serviceAccount.name to controller-identity")
+  (dict "name" "Helm release namespace" "value" (include "metacontroller.namespace" $metacontroller) "hint" "use --namespace registry-system")
+-}}
+{{- $parsed := printf "value: %s" $field.value | fromYaml -}}
+{{- if not (kindIs "string" (index $parsed "value")) -}}
+{{- fail (printf "%s must remain a string in the bundled chart YAML (resolved to %q); %s instead of a YAML number, boolean or null" $field.name $field.value $field.hint) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $account .Release.Name -}}
+{{- fail (printf "Metacontroller service account must differ from the webhook (%s); set metacontroller.serviceAccount.name to a different name" .Release.Name) -}}
+{{- end -}}
+{{- if and $metacontroller.Values.service $metacontroller.Values.service.enabled -}}
+{{- if not (regexMatch "^[a-z]" $fullname) -}}
+{{- fail (printf "Metacontroller Service name must begin with a letter (resolved to %q); set metacontroller.fullnameOverride to a name such as controller-1 or disable metacontroller.service.enabled" $fullname) -}}
+{{- end -}}
+{{- if eq $fullname .Release.Name -}}
+{{- fail (printf "Metacontroller service must differ from the webhook (%s); set metacontroller.fullnameOverride to a different name or disable metacontroller.service.enabled" .Release.Name) -}}
+{{- end -}}
+{{- end -}}

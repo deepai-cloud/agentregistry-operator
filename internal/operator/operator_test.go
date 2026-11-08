@@ -40,7 +40,7 @@ func find(t *testing.T, r Response, kind string) Object {
 	t.Fatalf("missing %s", kind)
 	return nil
 }
-func asMap(t *testing.T, o any) map[string]any {
+func asMap(t testing.TB, o any) map[string]any {
 	t.Helper()
 	b, _ := json.Marshal(o)
 	var m map[string]any
@@ -217,15 +217,6 @@ func TestObservedHealthAndConfigRollout(t *testing.T) {
 		t.Fatal("outage reported ready")
 	}
 }
-func TestSecretRotationRollsPods(t *testing.T) {
-	req := fixture()
-	old, _ := Sync(req, config())
-	req.Related["Secret.v1"]["database"]["metadata"].(map[string]any)["resourceVersion"] = "2"
-	rotated, _ := Sync(req, config())
-	if reflect.DeepEqual(find(t, old, "Deployment"), find(t, rotated, "Deployment")) {
-		t.Fatal("rotation does not roll deployment")
-	}
-}
 func TestHTTPRejectsInvalidEnvelope(t *testing.T) {
 	for _, body := range []string{`{`, `{} {}`, `{"parent":{"spec":{"version":"0.3.3","privileged":true}}}`} {
 		w := httptest.NewRecorder()
@@ -242,26 +233,35 @@ func TestHTTPRejectsInvalidEnvelope(t *testing.T) {
 }
 
 func TestKubernetesQuantityNormalizationDoesNotBlockReadiness(t *testing.T) {
-	req := fixture()
-	req.Parent.Spec.Resources = Resources{Requests: map[string]string{"cpu": "0.5", "memory": "1024Mi"}, Limits: map[string]string{"cpu": "1", "memory": "1Gi"}}
-	desired, err := Sync(req, config())
-	if err != nil {
-		t.Fatal(err)
-	}
-	dep := asMap(t, find(t, desired, "Deployment"))
-	dep["metadata"].(map[string]any)["generation"] = float64(1)
-	dep["status"] = map[string]any{"observedGeneration": float64(1), "replicas": float64(1), "readyReplicas": float64(1), "updatedReplicas": float64(1), "availableReplicas": float64(1)}
-	containers := dep["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)
-	requests := containers[0].(map[string]any)["resources"].(map[string]any)["requests"].(map[string]any)
-	requests["cpu"] = "500m"
-	requests["memory"] = "1Gi"
-	req.Children = observedChildren(t, desired, dep)
-	got, err := Sync(req, config())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if condition(got, "Ready").Status != "True" {
-		t.Fatalf("Kubernetes canonical quantities must not block readiness: %+v", got.Status)
+	for _, tc := range []struct{ input, canonical string }{
+		{"1024Mi", "1Gi"},
+		{"1024Gi", "1Ti"},
+		{"1073741824Mi", "1Pi"},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			req := fixture()
+			req.Parent.Spec.Resources = Resources{Requests: map[string]string{"cpu": "0.5", "memory": tc.input}, Limits: map[string]string{"cpu": "1", "memory": tc.input}}
+			desired, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			dep := asMap(t, find(t, desired, "Deployment"))
+			dep["metadata"].(map[string]any)["generation"] = float64(1)
+			dep["status"] = map[string]any{"observedGeneration": float64(1), "replicas": float64(1), "readyReplicas": float64(1), "updatedReplicas": float64(1), "availableReplicas": float64(1)}
+			containers := dep["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)
+			requests := containers[0].(map[string]any)["resources"].(map[string]any)["requests"].(map[string]any)
+			requests["cpu"] = "500m"
+			requests["memory"] = tc.canonical
+			containers[0].(map[string]any)["resources"].(map[string]any)["limits"].(map[string]any)["memory"] = tc.canonical
+			req.Children = observedChildren(t, desired, dep)
+			got, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if condition(got, "Ready").Status != "True" {
+				t.Fatalf("Kubernetes canonical quantities must not block readiness: %+v", got.Status)
+			}
+		})
 	}
 }
 

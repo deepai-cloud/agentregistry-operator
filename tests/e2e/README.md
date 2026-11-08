@@ -1,7 +1,7 @@
 # Managed PostgreSQL acceptance
 
 Run `make test-e2e` (or the equivalent `make test-k3s`) with Docker running.
-Install Go 1.25+, Helm, kubectl, Python 3, and **k3d 5.9.0**. The runner finds
+Install Go 1.26.10, Helm, kubectl, Python 3, and **k3d 5.9.0**. The runner finds
 `k3d` on `PATH` or in `.cache/tools/k3d`; `K3D` can specify another path. Set
 `DOCKER_CONTEXT` when needed. If the current Docker daemon is unavailable and no
 context override was supplied, the runner tries the `desktop-linux` context

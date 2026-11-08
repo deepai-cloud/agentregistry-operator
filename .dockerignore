@@ -5,4 +5,12 @@
 !cmd/**
 !internal/
 !internal/**
+# Reapply exclusions after the source-directory allowlist, including nested state.
+**/.local
+**/.cache
+**/.git
+**/.DS_Store
+**/__pycache__
+**/*.pyc
+**/testdata
 **/*_test.go

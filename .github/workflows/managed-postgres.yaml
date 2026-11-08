@@ -1,0 +1,60 @@
+name: managed-postgres
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.17.3
+      - name: Install pinned acceptance tools
+        shell: bash
+        run: |
+          tools_dir="$RUNNER_TEMP/managed-postgres-tools"
+          mkdir -p "$tools_dir"
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 180 \
+            https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64 \
+            --output "$tools_dir/k3d"
+          printf '%s  %s\n' 06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0 "$tools_dir/k3d" | sha256sum -c -
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 180 \
+            https://dl.k8s.io/release/v1.34.11/bin/linux/amd64/kubectl \
+            --output "$tools_dir/kubectl"
+          printf '%s  %s\n' 8efbb9435132a190920eb65a47a8c1ecf755ad85ab57a600c9bedbab460bb7a8 "$tools_dir/kubectl" | sha256sum -c -
+          chmod 0755 "$tools_dir/k3d" "$tools_dir/kubectl"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+      - name: Verify Docker build context exclusions
+        timeout-minutes: 3
+        run: make test-build-context
+      - name: Test health probes in both pinned registry images
+        timeout-minutes: 5
+        run: make test-registry-probes
+      - name: Test interrupted PostgreSQL initialization
+        timeout-minutes: 5
+        run: make test-postgres-bootstrap
+      - name: Exercise managed PostgreSQL in a disposable cluster
+        timeout-minutes: 25
+        run: make test-e2e
+      - name: Retain non-secret acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: managed-postgres-evidence
+          # Restrict the upload to result JSON; the work directory also holds a kubeconfig.
+          path: .cache/areg-managed-*/result.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

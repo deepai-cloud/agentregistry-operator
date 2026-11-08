@@ -7,3 +7,6 @@ metadata:
 spec:
   version: "0.3.3"
   authSecretName: registry-auth
+  database:
+    host: postgres.tenant-a.svc.cluster.local
+    secretName: registry-database

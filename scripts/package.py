@@ -13,13 +13,23 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-CHART = ROOT / "charts/agentregistry-operator"
+EXCLUDED_SOURCE_NAMES = ("__pycache__", "*.pyc", ".cache", ".local", ".git", ".DS_Store")
 # Build metadata is excluded because the same version becomes a container tag.
 VERSION_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
 )
+
+
+def source_path(relative):
+    """Check each component before entering a public input from the checkout."""
+    path = ROOT
+    for part in Path(relative).parts:
+        path = path / part
+        if path.is_symlink():
+            raise SystemExit(f"Refusing to distribute symlink: {path}")
+    return path
 
 
 def reject_symlinks(directory):
@@ -71,7 +81,8 @@ def package_binaries(staging, artifacts, prefix, release):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default=re.search(r"(?m)^version: (.+)$", (CHART / "Chart.yaml").read_text())[1])
+    chart_metadata = source_path("charts/agentregistry-operator/Chart.yaml")
+    parser.add_argument("--version", default=re.search(r"(?m)^version: (.+)$", chart_metadata.read_text())[1])
     parser.add_argument("--image", default="agentregistry-operator:dev")
     parser.add_argument("--binaries", action="store_true", help="include Linux amd64 and arm64 operator/gateway archives")
     args = parser.parse_args()
@@ -99,9 +110,8 @@ def main():
         output = staging / "artifacts"
         output.mkdir()
         chart = staging / "chart"
-        if CHART.is_symlink():
-            raise SystemExit(f"Refusing to distribute symlink: {CHART}")
-        shutil.copytree(CHART, chart, symlinks=True)
+        shutil.copytree(chart_metadata.parent, chart, symlinks=True,
+                        ignore=shutil.ignore_patterns(*EXCLUDED_SOURCE_NAMES))
         reject_symlinks(chart)
         values = (chart / "values.yaml").read_text()
         image = {"repository": repository, "tag": tag, "digest": digest, "pullPolicy": "IfNotPresent"}
@@ -117,12 +127,10 @@ def main():
         bundle.mkdir()
         # Explicit public inputs prevent private state and build outputs leaking.
         for name in ("LICENSE", "README.md", "Makefile", "Dockerfile", ".dockerignore", ".gitignore", "go.mod", "cmd", "internal", "charts", "scripts", "docs", "examples", ".github/workflows"):
-            source = ROOT / name
-            if source.is_symlink():
-                raise SystemExit(f"Refusing to distribute symlink: {source}")
+            source = source_path(name)
             if source.is_dir():
                 shutil.copytree(source, bundle / name, symlinks=True,
-                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".cache", ".local", ".git", ".DS_Store"))
+                                ignore=shutil.ignore_patterns(*EXCLUDED_SOURCE_NAMES))
             else:
                 shutil.copy2(source, bundle / name)
         shutil.copy2(archive, bundle / archive.name)
@@ -133,12 +141,21 @@ def main():
         artifacts = [archive, bundle_archive]
         if args.binaries:
             artifacts.extend(package_binaries(staging, output, prefix, release))
-        # Only publish complete artifacts from this run, never glob existing dist/.
         sums = output / "SHA256SUMS"
         sums.write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in artifacts))
+        files = [*artifacts, sums]
         destination.mkdir(exist_ok=True)
-        for path in [*artifacts, sums]:
-            shutil.copy2(path, destination / path.name)
+        # Stage on the destination filesystem so each rename replaces the
+        # directory entry, even when an old output links to another file.
+        with tempfile.TemporaryDirectory(dir=destination, prefix=".areg-package-") as pending:
+            incoming = Path(pending)
+            for path in files:
+                target = destination / path.name
+                if not target.is_symlink() and target.is_dir():
+                    raise SystemExit(f"Release output is a directory: {target}")
+                shutil.copy2(path, incoming / path.name)
+            for path in files:
+                (incoming / path.name).replace(destination / path.name)
     print(f"Artifacts ready in {destination}; image: {args.image}")
     print("No image, chart, or release has been published.")
 

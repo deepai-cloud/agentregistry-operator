@@ -128,15 +128,21 @@ trusted platform infrastructure. See the [security model](docs/security.md).
 
 ## Development
 
-Go 1.25.4, Helm 3 and Python 3 are needed for local verification. Docker and k3d
-are needed for the demo.
+Go 1.26.10, Helm 3 and Python 3 are used for local verification. Docker, k3d and
+kubectl are needed for the demo and live acceptance tests; acceptance requires
+k3d 5.9.0.
 
 ```sh
 make help       # available commands
 make verify     # race tests, vet, builds, chart contracts and documentation links
+make test-postgres-bootstrap # interrupted startup recovery in disposable Docker containers
+make test-e2e   # disposable K3s managed PostgreSQL acceptance test (k3d 5.9.0)
 make package    # chart, source bundle, Linux executables and SHA256SUMS in dist/
 make image      # combined operator/gateway container
 ```
+
+To measure the readiness check against all nine children of a managed registry,
+run `go test ./internal/operator -run '^$' -bench BenchmarkManagedChildrenCurrent -benchmem`.
 
 Packaging is local. The [release workflow](.github/workflows/release.yaml) publishes
 versioned multi-platform images, an OCI Helm chart and downloadable archives on

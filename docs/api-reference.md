@@ -15,8 +15,19 @@ application configuration is not exposed.
 characters. It becomes the name of the generated Service, Deployment,
 ServiceAccount and NetworkPolicy in the same namespace. Managed PostgreSQL uses
 `<name>-postgres` for its StatefulSet, Service, ConfigMap, Secret and NetworkPolicy;
-long names are shortened with a hash to fit the Service name limit. Reserve those
-names for the operator. Its StatefulSet creates `data-<database-name>-0` as a PVC.
+registry names longer than 52 characters are shortened with a hash. Database
+resource names are at most 61 characters, leaving room for the pod's `-0` suffix
+within Kubernetes' 63-character hostname limit. Reserve those names for the
+operator. Its StatefulSet creates `data-<database-name>-0` as a PVC. Earlier builds
+used longer database names; existing resources under those names require
+[explicit recovery](operations.md#recover-a-registry-with-a-long-name) before
+reconciliation can use the corrected identity.
+
+Distinct AgentRegistry names can still collide through their generated children.
+For example, managed registry `catalog` and another registry `catalog-postgres`
+both need the Service and NetworkPolicy named `catalog-postgres`. They must use
+different namespaces or non-overlapping names. Name validation does not check
+other registries in the namespace; reserve the complete set of generated names.
 
 ## Spec
 
@@ -33,8 +44,13 @@ names for the operator. Its StatefulSet creates `data-<database-name>-0` as a PV
 | `resources.requests.memory` | No | `"256Mi"` |
 | `resources.limits.cpu` | No | `"1"` |
 | `resources.limits.memory` | No | `"1Gi"` |
-| `exposure.hostname` | With `exposure` | DNS hostname containing a dot; literal IPs are not allowed |
+| `exposure.hostname` | With `exposure` | Lowercase DNS hostname containing a dot; literal IPs are not allowed |
 | `exposure.tlsSecretName` | With `exposure` | Same-namespace Secret with `tls.crt` and `tls.key` |
+
+Exposure hostnames have at least two DNS labels, each at most 63 characters, and
+at most 253 characters overall. Admission rejects literal IP addresses and
+overlong labels before reconciliation. Supply a hostname covered by the TLS
+certificate; wildcard names and trailing dots are not supported.
 
 Omit `database` for operator-managed PostgreSQL. To customize its persistent
 volume, set `database.storage` and optionally `database.storageClassName`. To use
@@ -42,16 +58,47 @@ your own database instead, set both `database.host` and `database.secretName` an
 omit managed storage settings. The entire `database` configuration is immutable,
 including whether the field was omitted: choose the mode, size and StorageClass
 before creation. Changes require migration or restore into a new registry.
+Storage sizes above 1Pi are rejected by CRD admission before immutable database
+settings are saved. Equivalent sizes are rendered using Kubernetes' canonical
+units: for example, `"1024Gi"` becomes `"1Ti"` in the generated PVC request.
 
-Secret references must be lowercase DNS labels, at most 63 characters, under the
-current CRD schema. None of the Secret fields accepts a reference to a different
-namespace.
+Nonempty `database.storageClassName` values must contain lowercase DNS labels,
+each at most 63 characters, separated by dots, with at most 253 characters in
+total. Empty labels and labels beginning or ending with a hyphen are rejected
+at admission before the immutable setting is saved. Omitting the field preserves
+the cluster default; `""` explicitly requests no storage class. Validation checks
+the name's syntax, not whether that StorageClass exists.
+
+Secret references accept lowercase DNS labels separated by dots, such as
+`registry.auth.v1`, with at most 63 characters per label and 253 characters overall.
+This applies to authentication, external database and TLS Secrets. None accepts
+a reference to a different namespace. Existing installations must
+[apply the updated CRD](operations.md#upgrade-the-operator-and-chart) before using
+dotted names or names longer than 63 characters.
 
 `resources` sizes the upstream `registry` container. The `gateway` container adds
 fixed requests of 50m CPU / 32Mi and limits of 250m CPU / 128Mi. CPU accepts positive
 whole cores, millicores, or decimals with up to three fractional digits. Memory
-accepts positive integer `Mi` or `Gi` quantities. Requests must not exceed their
-corresponding limits. Omitted individual fields retain their defaults.
+accepts positive integer `Mi` or `Gi` quantities up to 1Pi. Each quantity is limited
+to 32 characters. Requests must not exceed their corresponding limits. Omitted
+individual fields retain their defaults, including during admission validation:
+for example, a CPU request of `"2"` with no explicit limit is rejected because the
+default limit is `"1"`. Equivalent units such as `"9m"` and `"0.009"` compare exactly.
+
+Generated Deployment quantities use the units Kubernetes stores: for example,
+`"1000"` CPU cores becomes `"1k"`, and `"1024Gi"` memory becomes `"1Ti"`.
+This normalization prevents unit changes during API persistence from keeping an
+otherwise healthy registry in `Progressing`.
+
+Rollout hashes also use normalized quantities and filled-in defaults. Adding or
+removing explicit default values, or changing CPU `"1"` to `"1000m"`, preserves
+the running application pod. Changes to effective resource values still trigger
+a rollout. Adopting the normalized hash may cause one initial rollout for an
+existing registry.
+
+The CRD rejects invalid resource and database storage values before they can
+stall reconciliation. Existing installations must [apply the updated CRD](operations.md#upgrade-the-operator-and-chart)
+to enable these admission checks; Helm upgrades do not update CRDs automatically.
 
 Omit `exposure` for internal HTTP on port 8080. Supply both exposure fields for a
 TLS LoadBalancer on 443. `exposure: {}` is invalid. There is no replica-count,
@@ -62,9 +109,10 @@ Ingress, custom image, environment-variable or custom-port setting.
 | Secret type | Validation |
 | --- | --- |
 | Authentication | Nonempty username without colon/newline; password at least 16 bytes; JWT key exactly 64 hexadecimal characters |
-| Database | `postgres://` or `postgresql://` URI; exact configured host; username, nonempty password and database; port 5432 if specified; no URI fragment |
+| Database | URI beginning with lowercase `postgres://` or `postgresql://`; exact configured host; username, nonempty password and database without NUL bytes; port 5432 if specified; no URI fragment |
 | Database query | Only one each of `sslmode`, `sslrootcert`, `connect_timeout`; explicit `sslmode=disable`, `require` or `verify-full` |
-| Database CA | `verify-full` requires parseable PEM CA data in `ca.crt`, and the URI must set `sslrootcert=/database/ca.crt` |
+| Database timeout | If present, `connect_timeout` must be a nonnegative integer number of seconds, at most 9223372036 (the driver's duration limit); `0` disables this connection timeout |
+| Database CA | `verify-full` requires `sslrootcert=/database/ca.crt`; any explicit nonempty `sslrootcert` must use that path and have parseable PEM certificates in the Secret's `ca.crt`, including with `require` or `disable` |
 | Remote database | A literal-IP database requires `verify-full`; the server certificate must cover that IP |
 | Public TLS | Matching `tls.crt`/`tls.key`; certificate covers the hostname, allows server authentication and has no unsupported critical extensions |
 
@@ -73,19 +121,35 @@ are exercised by the running application. The gateway's readiness additionally
 checks the serving certificate's validity period. TLS certificate issuance,
 renewal, public CA trust and DNS remain platform responsibilities.
 
+The URI scheme must be lowercase because the pinned database driver interprets
+other casing as keyword/value settings instead of a URL. The database URI must
+explicitly name a database. Empty paths and paths containing
+only slashes, including percent-encoded slashes such as `/%2F`, are rejected so
+the driver cannot silently fall back to a default database. Percent-encoded NUL
+bytes (`%00`) in the username, password or database are rejected after URI decoding
+because PostgreSQL protocol strings use NUL terminators. A literal `%00` in a name
+or password remains valid when encoded as `%2500` in the URI.
+
+Missing database names, NUL bytes, malformed timeouts and missing or invalid
+referenced CA data set `DependenciesReady=False` with `InvalidOrMissingSecret`
+and scale the application to zero. Correcting the Secret resumes reconciliation
+without recreating the AgentRegistry. Timeout values use seconds
+(`connect_timeout=5`, not `5s` or `1.5`).
+
 Managed mode creates an immutable database Secret containing `url`, `username`,
 `password`, `postgres-password` and `database`. It reuses those credentials across
 reconciliations and operator restarts. The application receives only `url`; the
 administrator password remains available only to PostgreSQL. Auth/TLS Secret names
 must not collide with the managed database Secret name.
 
-Missing or invalid auth/TLS dependencies keep managed children present and scale
-the application Deployment to zero; PostgreSQL remains running. Missing or invalid
-managed database credentials also stop PostgreSQL. When a StatefulSet or retained
-PVC already exists, the operator refuses to invent replacement credentials;
+Missing, terminating or invalid auth/TLS dependencies scale the application
+Deployment to zero. Managed children stay present and PostgreSQL keeps running.
+Missing or invalid managed database credentials also stop PostgreSQL. When a
+StatefulSet or retained PVC already exists, the operator refuses to invent replacement credentials;
 restore the original database Secret. External database credentials remain
-user-managed. Referenced auth/TLS/external database Secret UID/resource-version
-changes roll the application. Secret contents are not copied into status.
+user-managed. Referenced auth/TLS/external database Secret data changes roll the
+application; ordinary label and annotation updates do not. Secret contents are
+not copied into status.
 
 ## Version changes
 
@@ -113,7 +177,8 @@ image does not change every registry's selected application version.
 | Condition / reason | Meaning |
 | --- | --- |
 | `DependenciesReady=True`, `Resolved` | Required Secrets exist and their configuration is valid |
-| `DependenciesReady=False`, `InvalidOrMissingSecret` | Missing or malformed dependency; message identifies the correction |
+| `DependenciesReady=False`, `Provisioning` | Fresh installation is waiting for persisted database credentials. A terminating Secret must disappear before bootstrap retries. The application stays stopped and PostgreSQL's StatefulSet is deferred. |
+| `DependenciesReady=False`, `InvalidOrMissingSecret` | A required Secret is missing, terminating or invalid. The message identifies what to fix. |
 | `Ready=False`, `DependencyNotReady` | Application replicas are stopped until dependencies are corrected |
 | `Ready=False`, `Progressing` | Waiting for matching children and a healthy current Deployment; managed mode also requires a healthy PostgreSQL StatefulSet |
 | `Ready=True`, `Available` | Current children match desired state; the application passes database/MCP readiness and managed PostgreSQL is healthy |
@@ -144,7 +209,7 @@ auth/TLS Secrets, DNS records or certificates, and does not back up database dat
 | --- | --- |
 | `/` | Upstream UI |
 | `/v0` | API base; catalog resources are servers, agents, skills and prompts, with health/version routes |
-| `/mcp` | MCP catalog interface; execution tools are blocked |
+| `/mcp` | MCP catalog interface; discovery lists only allowed catalog tools and prompts, and execution calls are blocked |
 
 All client routes require Basic authentication. Registry artifact storage is
 supported; running agents, deploying workloads and executing tools are outside

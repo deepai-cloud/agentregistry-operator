@@ -8,12 +8,13 @@ is selected, modified, or deleted. Secrets are sent on stdin and never logged.
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -34,6 +35,12 @@ def say(message):
     print(message, flush=True)
 
 
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Only the owned loopback port-forward may receive test credentials.
+        return None
+
+
 class Acceptance:
     def __init__(self):
         self.cluster = "areg-managed-" + uuid.uuid4().hex[:10]
@@ -51,10 +58,15 @@ class Acceptance:
         self.created = False
         self.forward = None
         self.forward_output = None
+        self.http_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirects())
         self.evidence = {"cluster": self.cluster, "k3s_image": K3S_IMAGE, "checks": []}
 
     def sanitize(self, text):
-        for value in self.sensitive:
+        # kubectl patch errors can include Secret data in base64 as well as
+        # stringData. Redact complete URLs before their password substrings.
+        values = {value for value in self.sensitive if value}
+        values.update(base64.b64encode(value.encode()).decode() for value in self.sensitive if value)
+        for value in sorted(values, key=lambda value: (-len(value), value)):
             text = text.replace(value, "[redacted]")
         return text
 
@@ -260,6 +272,58 @@ class Acceptance:
             if result.returncode == 0 or "Invalid" not in result.stderr:
                 raise RuntimeError("Invalid external database settings were not rejected by admission")
         self.check("live admission rejects database mode/storage changes and invalid external settings")
+        cases = json.loads((ROOT / "internal/operator/testdata/resource-validation.json").read_text())
+        for case in cases:
+            obj = {
+                "apiVersion": "registry.deepai.cloud/v1alpha1", "kind": "AgentRegistry",
+                "metadata": {"name": "resource-admission", "namespace": NAMESPACE},
+                "spec": {"version": "0.3.3", "authSecretName": "registry-auth", "resources": case["resources"]},
+            }
+            created = self.kubectl("create", "--dry-run=server", "--validate=false", "-f", "-", input=json.dumps(obj), check=False)
+            updated = self.kubectl(
+                "patch", "agentregistry", NAME, "-n", NAMESPACE, "--type=json", "--dry-run=server",
+                "--patch", json.dumps([{"op": "add", "path": "/spec/resources", "value": case["resources"]}]),
+                check=False,
+            )
+            for operation, result in (("create", created), ("update", updated)):
+                if (result.returncode == 0) != case["valid"] or (not case["valid"] and "Invalid" not in result.stderr):
+                    raise RuntimeError(f"Resource admission disagrees with operator validation: {case['name']} ({operation})\n{result.stderr}")
+        self.check(f"live admission and operator agree on {len(cases)} resource cases for both create and update")
+        cases = json.loads((ROOT / "internal/operator/testdata/database-storage-validation.json").read_text())
+        for case in cases:
+            obj = {
+                "apiVersion": "registry.deepai.cloud/v1alpha1", "kind": "AgentRegistry",
+                "metadata": {"name": "storage-admission", "namespace": NAMESPACE},
+                "spec": {"version": "0.3.3", "authSecretName": "registry-auth", "database": case["database"]},
+            }
+            result = self.kubectl("create", "--dry-run=server", "--validate=false", "-f", "-", input=json.dumps(obj), check=False)
+            if (result.returncode == 0) != case["valid"] or (not case["valid"] and "Invalid" not in result.stderr):
+                raise RuntimeError(f"Storage admission disagrees with operator validation: {case['name']}\n{result.stderr}")
+        self.check(f"live admission and operator agree on {len(cases)} storage cases without provisioning volumes")
+        self.inspect_exposure_admission()
+
+    def inspect_exposure_admission(self):
+        cases = json.loads((ROOT / "internal/operator/testdata/exposure-hostname-validation.json").read_text())
+        for case in cases:
+            exposure = {"hostname": case["hostname"], "tlsSecretName": "admission-only-tls"}
+            obj = {
+                "apiVersion": "registry.deepai.cloud/v1alpha1", "kind": "AgentRegistry",
+                "metadata": {"name": "exposure-admission", "namespace": NAMESPACE},
+                "spec": {"version": "0.3.3", "authSecretName": "registry-auth", "exposure": exposure},
+            }
+            # Exercise the installed CRD without changing the private registry
+            # or creating a LoadBalancer/certificate dependency for valid names.
+            created = self.kubectl("create", "--dry-run=server", "--validate=false", "-f", "-",
+                                   input=json.dumps(obj), check=False)
+            updated = self.kubectl(
+                "patch", "agentregistry", NAME, "-n", NAMESPACE, "--type=json", "--dry-run=server",
+                "--patch", json.dumps([{"op": "add", "path": "/spec/exposure", "value": exposure}]),
+                check=False,
+            )
+            for operation, result in (("create", created), ("update", updated)):
+                if (result.returncode == 0) != case["valid"] or (not case["valid"] and "Invalid" not in result.stderr):
+                    raise RuntimeError(f"Exposure admission disagrees with operator validation: {case['name']} ({operation})\n{result.stderr}")
+        self.check(f"live admission and operator agree on {len(cases)} exposure hostname cases for both create and update")
 
     def http(self, authenticated):
         headers = {}
@@ -267,30 +331,31 @@ class Acceptance:
             headers["Authorization"] = "Basic " + base64.b64encode((self.username + ":" + self.password).encode()).decode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/v0/servers?limit=1", headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with self.http_opener.open(request, timeout=10) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
-            return error.code, error.read()
+            with error:
+                return error.code, error.read()
 
     def start_forward(self):
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            self.port = sock.getsockname()[1]
-        self.forward_output = open(self.work / "port-forward.log", "w")
+        log = self.work / "port-forward.log"
+        self.forward_output = log.open("w")
         self.forward = subprocess.Popen([
             "kubectl", "--kubeconfig", str(self.kubeconfig), "--context", self.context,
             "-n", NAMESPACE, "port-forward", "service/" + NAME,
-            f"{self.port}:8080", "--address=127.0.0.1",
+            ":8080", "--address=127.0.0.1",
         ], stdout=self.forward_output, stderr=subprocess.STDOUT, env=self.env)
 
         def listening():
             if self.forward.poll() is not None:
                 raise RuntimeError("Registry port-forward exited early")
-            try:
-                with socket.create_connection(("127.0.0.1", self.port), timeout=1):
-                    return True
-            except OSError:
+            # kubectl announces the OS-assigned local port after it has bound
+            # the listener. The remote port in this line is the pod targetPort.
+            match = re.search(rb"^Forwarding from 127\.0\.0\.1:(\d+) -> \d+\r?\n", log.read_bytes(), re.MULTILINE)
+            if not match:
                 return False
+            self.port = int(match[1])
+            return True
         self.wait("registry port-forward", listening, timeout=20)
 
     def inspect_http(self):
@@ -316,7 +381,18 @@ class Acceptance:
 
         self.wait("PostgreSQL pod restart", restarted)
         self.wait("registry recovers database readiness", self.ready)
-        self.wait("authenticated API recovers after database restart", lambda: self.http(True)[0] == 200)
+
+        def http_recovered():
+            if self.forward is None or self.forward.poll() is not None:
+                raise RuntimeError("Registry port-forward is not running during API recovery")
+            try:
+                return self.http(True)[0] == 200
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
+                # Connection loss, timeouts and truncated responses can occur
+                # during recovery. Keep retrying within wait's existing deadline.
+                return False
+
+        self.wait("authenticated API recovers after database restart", http_recovered)
         current = self.get("secret", DB_NAME)
         if current["metadata"]["uid"] != self.db_secret["metadata"]["uid"] or current["data"] != self.db_secret["data"]:
             raise RuntimeError("Managed credentials changed across reconciliation/restart")
@@ -388,19 +464,34 @@ class Acceptance:
         say(self.sanitize(result.stdout))
 
     def cleanup(self):
-        if self.forward:
-            self.forward.terminate()
-            try:
-                self.forward.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.forward.kill()
-                self.forward.wait(timeout=10)
-        if self.forward_output:
-            self.forward_output.close()
-        if self.created:
-            say("Removing owned cluster " + self.cluster)
-            self.run([self.k3d, "cluster", "delete", self.cluster], timeout=150)
-        self.kubeconfig.unlink(missing_ok=True)
+        # Local process/file failures must not leave the disposable cluster
+        # running. Attempt each stage, then report all failures to main.
+        errors = []
+        try:
+            if self.forward:
+                self.forward.terminate()
+                try:
+                    self.forward.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.forward.kill()
+                    self.forward.wait(timeout=10)
+        except Exception as error:
+            errors.append("port-forward shutdown: " + str(error))
+        try:
+            if self.forward_output:
+                self.forward_output.close()
+        except Exception as error:
+            errors.append("port-forward log close: " + str(error))
+        try:
+            if self.created:
+                say("Removing owned cluster " + self.cluster)
+                self.run([self.k3d, "cluster", "delete", self.cluster], timeout=150)
+            # Keep the private config for recovery if cluster deletion failed.
+            self.kubeconfig.unlink(missing_ok=True)
+        except Exception as error:
+            errors.append("cluster cleanup: " + str(error))
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
 
 def main():

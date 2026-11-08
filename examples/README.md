@@ -37,8 +37,18 @@ python3 examples/local/create-secrets.py --external-database \
 ```
 
 Apply the generated `secrets.json` before `local/postgres.yaml` and
-`external-database.yaml`.
+`external-database.yaml`. The registry example selects
+`postgres.tenant-a.svc.cluster.local` and the `registry-database` Secret generated
+above. Change both the manifest's host and the Secret's connection URI if using
+a different database Service.
 
 The generated Secret manifest and credential files contain plaintext credentials;
-keep them out of version control. See [creating a registry](../docs/creating-a-registry.md)
+keep them out of version control. The generator writes all three files privately
+before publishing them, with `secrets.json` last so the demo only reuses a complete
+set. Write errors and handled interruptions clean up this attempt's files;
+existing files and symlinks are never overwritten. After an abrupt process kill
+or machine failure, inspect any remaining files before retrying; do not discard
+credentials already applied to a cluster.
+
+See [creating a registry](../docs/creating-a-registry.md)
 for managed storage, TLS and external database configuration.

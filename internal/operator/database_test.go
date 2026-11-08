@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/url"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ func databaseChild(t *testing.T, r Response, kind, name string) Object {
 	return nil
 }
 
-func observeDatabaseChildren(t *testing.T, r Response) map[string]map[string]Object {
+func observeDatabaseChildren(t testing.TB, r Response) map[string]map[string]Object {
 	t.Helper()
 	observed := map[string]map[string]Object{}
 	for _, child := range r.Children {
@@ -41,12 +42,151 @@ func observeDatabaseChildren(t *testing.T, r Response) map[string]map[string]Obj
 	return observed
 }
 
-func TestManagedDatabaseProvisionsCompleteInstallation(t *testing.T) {
-	req := managedFixture()
+// Complete the credential-persistence phase before inspecting a provisioned database.
+func provisionManagedDatabase(t testing.TB, req Request) Response {
+	t.Helper()
+	initial, err := Sync(req, config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Children = observeDatabaseChildren(t, initial)
 	got, err := Sync(req, config())
 	if err != nil {
 		t.Fatal(err)
 	}
+	return got
+}
+
+// Measure the recurring readiness comparison with all nine managed children
+// present in the same JSON representation delivered by the webhook.
+func BenchmarkManagedChildrenCurrent(b *testing.B) {
+	req := managedFixture()
+	desired := provisionManagedDatabase(b, req)
+	req.Children = observeDatabaseChildren(b, desired)
+	b.ReportAllocs()
+	for b.Loop() {
+		if !observedCurrent(req, desired.Children) {
+			b.Fatal("matching children reported as stale")
+		}
+	}
+}
+
+func TestManagedDatabaseWaitsForPersistedCredentials(t *testing.T) {
+	for _, watch := range []string{"children", "related"} {
+		t.Run(watch, func(t *testing.T) {
+			req := managedFixture()
+			name := databaseName(req.Parent)
+			var secret Object
+			for attempt := 0; attempt < 3; attempt++ {
+				got, err := Sync(req, config())
+				if err != nil {
+					t.Fatal(err)
+				}
+				secret = databaseChild(t, got, "Secret", name)
+				for _, child := range got.Children {
+					if child["kind"] == "StatefulSet" {
+						t.Fatal("must persist credentials before creating a StatefulSet that could provision storage")
+					}
+				}
+				if number(object(databaseChild(t, got, "Deployment", "catalog")["spec"])["replicas"]) != 0 {
+					t.Fatal("application must wait for persisted database credentials")
+				}
+				if condition(got, "Ready").Status != "False" || condition(got, "DependenciesReady").Status != "False" ||
+					condition(got, "DependenciesReady").Reason != "Provisioning" || got.ResyncAfterSeconds <= 0 {
+					t.Fatal("pending credentials must report provisioning and retry")
+				}
+				// Metacontroller may create every other child even if Secret creation fails.
+				req.Children = observeDatabaseChildren(t, got)
+				delete(req.Children, "Secret.v1")
+			}
+			if watch == "children" {
+				req.Children["Secret.v1"] = map[string]Object{"tenant-a/" + name: secret}
+			} else {
+				req.Related["Secret.v1"][name] = secret
+			}
+			started, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(secret["data"], databaseChild(t, started, "Secret", name)["data"]) {
+				t.Fatal("startup must reuse the credentials that were successfully persisted")
+			}
+			if condition(started, "DependenciesReady").Status != "True" ||
+				number(object(databaseChild(t, started, "StatefulSet", name)["spec"])["replicas"]) != 1 ||
+				number(object(databaseChild(t, started, "Deployment", "catalog")["spec"])["replicas"]) != 1 {
+				t.Fatal("observing persisted credentials must unblock database and application startup")
+			}
+			req.Children = observeDatabaseChildren(t, started)
+			again, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(started.Children, again.Children) {
+				t.Fatal("a controller restart after credential persistence must preserve the desired resources")
+			}
+		})
+	}
+}
+
+func TestManagedDatabaseWaitsForDeletingCredentials(t *testing.T) {
+	for _, watch := range []string{"child", "related", "related-ahead-of-child"} {
+		t.Run(watch, func(t *testing.T) {
+			req := managedFixture()
+			name := databaseName(req.Parent)
+			initial, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Children = observeDatabaseChildren(t, initial)
+			secret := req.Children["Secret.v1"][req.Parent.Metadata.Namespace+"/"+name]
+			object(secret["metadata"])["uid"] = "deleting-secret"
+			deleting := asMap(t, secret)
+			object(deleting["metadata"])["deletionTimestamp"] = "2026-11-04T12:00:00Z"
+			switch watch {
+			case "child":
+				req.Children["Secret.v1"][req.Parent.Metadata.Namespace+"/"+name] = deleting
+			case "related":
+				delete(req.Children, "Secret.v1")
+				req.Related["Secret.v1"][name] = deleting
+			case "related-ahead-of-child":
+				req.Related["Secret.v1"][name] = deleting
+			}
+			got, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if condition(got, "DependenciesReady").Reason != "Provisioning" ||
+				number(object(databaseChild(t, got, "Deployment", req.Parent.Metadata.Name)["spec"])["replicas"]) != 0 {
+				t.Fatal("a terminating database Secret must not start a fresh installation")
+			}
+			for _, child := range got.Children {
+				if child["kind"] == "StatefulSet" || child["kind"] == "Secret" {
+					t.Fatal("must wait for Secret deletion before replacing credentials or provisioning storage")
+				}
+			}
+			if watch == "related-ahead-of-child" {
+				// Once the child watch observes a replacement, the old UID's
+				// deletion timestamp must not withhold the replacement Secret.
+				object(secret["metadata"])["uid"] = "replacement-secret"
+				resumed, err := Sync(req, config())
+				if err != nil || condition(resumed, "DependenciesReady").Status != "True" ||
+					!reflect.DeepEqual(secret["data"], databaseChild(t, resumed, "Secret", name)["data"]) {
+					t.Fatal("stale deletion blocked use of the persisted replacement")
+				}
+			}
+			delete(req.Children, "Secret.v1")
+			delete(req.Related["Secret.v1"], name)
+			retried := provisionManagedDatabase(t, req)
+			if condition(retried, "DependenciesReady").Status != "True" {
+				t.Fatal("fresh bootstrap did not resume after the deleting Secret disappeared")
+			}
+		})
+	}
+}
+
+func TestManagedDatabaseProvisionsCompleteInstallation(t *testing.T) {
+	req := managedFixture()
+	got := provisionManagedDatabase(t, req)
 	if len(got.Children) != 9 {
 		t.Fatalf("want four application and five database children, got %d", len(got.Children))
 	}
@@ -138,6 +278,75 @@ func TestManagedDatabaseProvisionsCompleteInstallation(t *testing.T) {
 	}
 }
 
+func TestManagedDatabaseWiresResumableStartup(t *testing.T) {
+	req := managedFixture()
+	name := databaseName(req.Parent)
+	initial, err := Sync(req, config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Children = observeDatabaseChildren(t, initial)
+	// Additional keys can be present when credentials have been persisted
+	// and the StatefulSet is about to initialize its first database.
+	observed := req.Children["ConfigMap.v1"][req.Parent.Metadata.Namespace+"/"+name]
+	object(observed["data"])["99-extra.sql"] = "SELECT 1;"
+	got, err := Sync(req, config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := databaseChild(t, got, "ConfigMap", name)
+	data := object(cm["data"])
+	template := object(object(databaseChild(t, got, "StatefulSet", name)["spec"])["template"])
+	pod := object(template["spec"])
+	container := object(pod["containers"].([]any)[0])
+	if !reflect.DeepEqual(container["command"], []any{"/bin/bash", "/docker-entrypoint-initdb.d/start-postgres"}) ||
+		!reflect.DeepEqual(container["args"], []any{"postgres"}) {
+		t.Fatal("PostgreSQL must invoke the resume wrapper before the image entrypoint")
+	}
+	if object(object(template["metadata"])["annotations"])[fingerprintKey] != hash(data) {
+		t.Fatal("bootstrap script updates must roll out the database pod")
+	}
+	mounted := false
+	for _, mount := range container["volumeMounts"].([]any) {
+		m := object(mount)
+		if m["mountPath"] != "/docker-entrypoint-initdb.d" || m["readOnly"] != true {
+			continue
+		}
+		for _, volume := range pod["volumes"].([]any) {
+			v := object(volume)
+			source := object(v["configMap"])
+			if v["name"] != m["name"] || source["name"] != name || number(source["defaultMode"]) != 0444 {
+				continue
+			}
+			items, _ := source["items"].([]any)
+			files := Object{}
+			for _, raw := range items {
+				item := object(raw)
+				path, _ := item["path"].(string)
+				files[path] = item["key"]
+			}
+			if !reflect.DeepEqual(files, Object{"01-registry.sh": "01-registry.sh", "start-postgres": "start-postgres"}) {
+				t.Fatalf("only generated scripts may reach PostgreSQL's init directory; got items: %v", items)
+			}
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatal("startup scripts must be mounted from the generated ConfigMap as non-executable, read-only files")
+	}
+	for _, filename := range []string{"01-registry.sh", "start-postgres"} {
+		script, ok := data[filename].(string)
+		if !ok || script == "" {
+			t.Fatalf("missing startup script %s", filename)
+		}
+		cmd := exec.Command("bash", "-n")
+		cmd.Stdin = strings.NewReader(script)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("invalid shell script %s: %s (%v)", filename, output, err)
+		}
+	}
+}
+
 func TestManagedDatabaseCredentialsSurviveReconciliation(t *testing.T) {
 	req := managedFixture()
 	first, err := Sync(req, config())
@@ -209,10 +418,7 @@ func TestManagedDatabaseInvalidCredentialsDoNotRotatePersistentPasswords(t *test
 	for _, changed := range []string{"username", "password", "database", "postgres-password"} {
 		t.Run(changed, func(t *testing.T) {
 			req := managedFixture()
-			first, err := Sync(req, config())
-			if err != nil {
-				t.Fatal(err)
-			}
+			first := provisionManagedDatabase(t, req)
 			req.Children = observeDatabaseChildren(t, first)
 			name := databaseName(req.Parent)
 			secret := req.Children["Secret.v1"]["tenant-a/"+name]
@@ -235,14 +441,74 @@ func TestManagedDatabaseInvalidCredentialsDoNotRotatePersistentPasswords(t *test
 	}
 }
 
+func TestManagedDatabaseRejectsInvalidRestoredCredentials(t *testing.T) {
+	req := managedFixture()
+	name := databaseName(req.Parent)
+	first := provisionManagedDatabase(t, req)
+	original := databaseChild(t, first, "Secret", name)
+	claim := "data-" + name + "-0"
+	req.Related["PersistentVolumeClaim.v1"] = map[string]Object{claim: {
+		"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+		"metadata": Object{"name": claim, "namespace": req.Parent.Metadata.Namespace},
+	}}
+
+	for _, bad := range []string{"shared password", "NUL in role password", "NUL in admin password", "non-PostgreSQL URI", "URI fragment", "uppercase scheme", "mixed-case scheme"} {
+		t.Run(bad, func(t *testing.T) {
+			restored := asMap(t, original)
+			data := object(restored["data"])
+			u, err := url.Parse(string(secretData(restored, "url")))
+			if err != nil {
+				t.Fatal("invalid generated URL")
+			}
+			switch bad {
+			case "shared password":
+				data["password"] = data["postgres-password"]
+			case "NUL in role password", "NUL in admin password":
+				key := "password"
+				if bad == "NUL in admin password" {
+					key = "postgres-password"
+				}
+				data[key] = base64.StdEncoding.EncodeToString(append(secretData(restored, key), 0, 'x'))
+			case "non-PostgreSQL URI":
+				u.Scheme = "https"
+			case "URI fragment":
+				u.Fragment = "unexpected"
+			case "uppercase scheme":
+				u.Scheme = "POSTGRES"
+			case "mixed-case scheme":
+				u.Scheme = "PostgreSQL"
+			}
+			// Preserve URL/password agreement so it doesn't mask the bad restore.
+			u.User = url.UserPassword("registry", string(secretData(restored, "password")))
+			data["url"] = base64.StdEncoding.EncodeToString([]byte(u.String()))
+			req.Related["Secret.v1"][name] = restored
+			got, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := number(object(databaseChild(t, got, "Deployment", req.Parent.Metadata.Name)["spec"])["replicas"])
+			db := number(object(databaseChild(t, got, "StatefulSet", name)["spec"])["replicas"])
+			if condition(got, "DependenciesReady").Reason != "InvalidOrMissingSecret" ||
+				condition(got, "Ready").Reason != "DependencyNotReady" || app != 0 || db != 0 {
+				t.Fatalf("bad restore requested %.0f registry and %.0f PostgreSQL replicas, want both stopped", app, db)
+			}
+			if !reflect.DeepEqual(data, databaseChild(t, got, "Secret", name)["data"]) {
+				t.Fatal("operator changed the restored credentials")
+			}
+			req.Related["Secret.v1"][name] = original
+			repaired, err := Sync(req, config())
+			if err != nil || condition(repaired, "DependenciesReady").Status != "True" || !reflect.DeepEqual(repaired.Children, first.Children) {
+				t.Fatal("restoring the original credentials must resume both workloads with their original configuration")
+			}
+		})
+	}
+}
+
 func TestManagedDatabaseMissingCredentialsNeverReinitializeExistingStorage(t *testing.T) {
 	for _, retained := range []string{"StatefulSet", "PersistentVolumeClaim"} {
 		t.Run(retained, func(t *testing.T) {
 			req := managedFixture()
-			first, err := Sync(req, config())
-			if err != nil {
-				t.Fatal(err)
-			}
+			first := provisionManagedDatabase(t, req)
 			name := databaseName(req.Parent)
 			if retained == "StatefulSet" {
 				req.Children = map[string]map[string]Object{"StatefulSet.apps/v1": {"tenant-a/" + name: databaseChild(t, first, retained, name)}}
@@ -264,8 +530,18 @@ func TestManagedDatabaseMissingCredentialsNeverReinitializeExistingStorage(t *te
 			if number(object(databaseChild(t, got, "Deployment", "catalog")["spec"])["replicas"]) != 0 {
 				t.Fatal("application must stop until original database credentials are restored")
 			}
-			databaseChild(t, got, "StatefulSet", name)
+			if number(object(databaseChild(t, got, "StatefulSet", name)["spec"])["replicas"]) != 0 {
+				t.Fatal("database must remain stopped while its persistent credentials are missing")
+			}
 			// Restoration may be an unowned Secret seen through related resources.
+			deleting := databaseChild(t, first, "Secret", name)
+			object(deleting["metadata"])["deletionTimestamp"] = "2026-11-04T12:00:00Z"
+			req.Related["Secret.v1"][name] = deleting
+			blocked, err := Sync(req, config())
+			if err != nil || !reflect.DeepEqual(blocked.Children, got.Children) ||
+				condition(blocked, "DependenciesReady").Reason != "InvalidOrMissingSecret" {
+				t.Fatal("terminating credentials must leave existing storage in the same stopped recovery state as missing credentials")
+			}
 			req.Related["Secret.v1"][name] = databaseChild(t, first, "Secret", name)
 			restored, err := Sync(req, config())
 			if err != nil || condition(restored, "DependenciesReady").Status != "True" {
@@ -273,6 +549,9 @@ func TestManagedDatabaseMissingCredentialsNeverReinitializeExistingStorage(t *te
 			}
 			if !reflect.DeepEqual(databaseChild(t, first, "Secret", name)["data"], databaseChild(t, restored, "Secret", name)["data"]) {
 				t.Fatal("restored database credentials were overwritten")
+			}
+			if number(object(databaseChild(t, restored, "StatefulSet", name)["spec"])["replicas"]) != 1 {
+				t.Fatal("restoring original credentials must restart the database")
 			}
 		})
 	}
@@ -293,10 +572,7 @@ func TestManagedDatabaseStorageAndLocalDependencies(t *testing.T) {
 				req.Parent.Spec.Database.Storage = tc.storage
 			}
 			req.Parent.Spec.Database.StorageClassName = tc.class
-			got, err := Sync(req, config())
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := provisionManagedDatabase(t, req)
 			sts := databaseChild(t, got, "StatefulSet", databaseName(req.Parent))
 			spec := object(sts["spec"])
 			retention := object(spec["persistentVolumeClaimRetentionPolicy"])
@@ -358,10 +634,7 @@ func labelsMatch(selector, labels Object) bool {
 
 func TestManagedDatabaseNetworkSelectorsSeparateApplicationAndDatabase(t *testing.T) {
 	req := managedFixture()
-	got, err := Sync(req, config())
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := provisionManagedDatabase(t, req)
 	name := databaseName(req.Parent)
 	appSpec := object(databaseChild(t, got, "Deployment", "catalog")["spec"])
 	dbSpec := object(databaseChild(t, got, "StatefulSet", name)["spec"])
@@ -399,11 +672,13 @@ func TestManagedDatabaseNetworkSelectorsSeparateApplicationAndDatabase(t *testin
 
 func TestManagedDatabaseAuthFailureKeepsDatabase(t *testing.T) {
 	req := managedFixture()
-	first, err := Sync(req, config())
+	first := provisionManagedDatabase(t, req)
+	req.Children = observeDatabaseChildren(t, first)
+	object(req.Related["Secret.v1"]["auth"]["metadata"])["deletionTimestamp"] = "2026-11-04T12:00:00Z"
+	terminating, err := Sync(req, config())
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Children = observeDatabaseChildren(t, first)
 	delete(req.Related["Secret.v1"], "auth")
 	got, err := Sync(req, config())
 	if err != nil {
@@ -418,56 +693,67 @@ func TestManagedDatabaseAuthFailureKeepsDatabase(t *testing.T) {
 	if !reflect.DeepEqual(databaseChild(t, first, "Secret", databaseName(req.Parent))["data"], databaseChild(t, got, "Secret", databaseName(req.Parent))["data"]) {
 		t.Fatal("auth failure rotated database credentials")
 	}
+	if !reflect.DeepEqual(terminating.Children, got.Children) {
+		t.Fatal("terminating auth must stop the registry and preserve PostgreSQL just as missing auth does")
+	}
 }
 
 func TestManagedDatabaseReadinessRequiresHealthyStatefulSet(t *testing.T) {
-	req := managedFixture()
-	req.Parent.Spec.Database.Storage = "1024Mi"
-	desired, err := Sync(req, config())
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Children = observeDatabaseChildren(t, desired)
-	// Reconcile once with the generated Secret now observed before completing
-	// both rollouts, so the app uses the current dependency fingerprint.
-	desired, err = Sync(req, config())
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Children = observeDatabaseChildren(t, desired)
-	for _, group := range req.Children {
-		for _, child := range group {
-			switch child["kind"] {
-			case "NetworkPolicy":
-				// The API omits empty rule arrays while policyTypes still denies egress.
-				if object(child["metadata"])["name"] == databaseName(req.Parent) {
-					delete(object(child["spec"]), "egress")
-				}
-			case "Deployment", "StatefulSet":
-				object(child["metadata"])["generation"] = 1
-				child["status"] = Object{"observedGeneration": 1, "replicas": 1, "readyReplicas": 1, "availableReplicas": 1, "updatedReplicas": 1, "currentReplicas": 1, "currentRevision": "revision-1", "updateRevision": "revision-1"}
-				if child["kind"] == "StatefulSet" {
-					// Kubernetes canonicalizes equivalent quantities on persistence.
-					claims := object(child["spec"])["volumeClaimTemplates"].([]any)
-					object(object(object(object(claims[0])["spec"])["resources"])["requests"])["storage"] = "1Gi"
+	for _, tc := range []struct{ input, canonical string }{
+		{"1024Mi", "1Gi"},
+		{"1024Gi", "1Ti"},
+		{"1073741824Mi", "1Pi"},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			req := managedFixture()
+			req.Parent.Spec.Database.Storage = tc.input
+			desired, err := Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Children = observeDatabaseChildren(t, desired)
+			// Once the generated Secret is observed, reconciliation creates the database
+			// workload and starts the application before completing both rollouts.
+			desired, err = Sync(req, config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Children = observeDatabaseChildren(t, desired)
+			for _, group := range req.Children {
+				for _, child := range group {
+					switch child["kind"] {
+					case "NetworkPolicy":
+						// The API omits empty rule arrays while policyTypes still denies egress.
+						if object(child["metadata"])["name"] == databaseName(req.Parent) {
+							delete(object(child["spec"]), "egress")
+						}
+					case "Deployment", "StatefulSet":
+						object(child["metadata"])["generation"] = 1
+						child["status"] = Object{"observedGeneration": 1, "replicas": 1, "readyReplicas": 1, "availableReplicas": 1, "updatedReplicas": 1, "currentReplicas": 1, "currentRevision": "revision-1", "updateRevision": "revision-1"}
+						if child["kind"] == "StatefulSet" {
+							// Kubernetes canonicalizes equivalent quantities on persistence.
+							claims := object(child["spec"])["volumeClaimTemplates"].([]any)
+							object(object(object(object(claims[0])["spec"])["resources"])["requests"])["storage"] = tc.canonical
+						}
+					}
 				}
 			}
-		}
-	}
-	ready, err := Sync(req, config())
-	if err != nil || condition(ready, "Ready").Status != "True" {
-		t.Fatalf("complete observed managed installation should be ready: %v %+v", err, ready.Status)
-	}
-	for _, group := range req.Children {
-		for _, child := range group {
-			if child["kind"] == "StatefulSet" {
-				object(child["status"])["readyReplicas"] = 0
+			ready, err := Sync(req, config())
+			if err != nil || condition(ready, "Ready").Status != "True" {
+				t.Fatalf("complete observed managed installation should be ready: %v %+v", err, ready.Status)
 			}
-		}
-	}
-	unready, err := Sync(req, config())
-	if err != nil || condition(unready, "Ready").Status != "False" {
-		t.Fatalf("healthy application must not hide a database outage: %v %+v", err, unready.Status)
+			for _, group := range req.Children {
+				for _, child := range group {
+					if child["kind"] == "StatefulSet" {
+						object(child["status"])["readyReplicas"] = 0
+					}
+				}
+			}
+			unready, err := Sync(req, config())
+			if err != nil || condition(unready, "Ready").Status != "False" {
+				t.Fatalf("healthy application must not hide a database outage: %v %+v", err, unready.Status)
+			}
+		})
 	}
 }
 
@@ -500,7 +786,7 @@ func TestDatabaseModeValidationAndExternalCompatibility(t *testing.T) {
 
 func TestManagedDatabaseNamesSupportFullLengthRegistryNames(t *testing.T) {
 	seen := map[string]bool{}
-	for _, parentName := range []string{strings.Repeat("a", 54), strings.Repeat("a", 63), strings.Repeat("a", 62) + "b"} {
+	for _, parentName := range []string{"catalog", strings.Repeat("a", 52), strings.Repeat("a", 53), strings.Repeat("a", 54), strings.Repeat("a", 55), strings.Repeat("a", 63), strings.Repeat("a", 62) + "b"} {
 		req := managedFixture()
 		req.Parent.Metadata.Name = parentName
 		name := databaseName(req.Parent)
@@ -508,18 +794,31 @@ func TestManagedDatabaseNamesSupportFullLengthRegistryNames(t *testing.T) {
 			t.Fatalf("full-length parent needs a valid, distinct database Service name, got %q", name)
 		}
 		seen[name] = true
-		got, err := Sync(req, config())
-		if err != nil {
-			t.Fatal(err)
+		if !localName(name + "-0") {
+			t.Errorf("PostgreSQL pod hostname exceeds the DNS label limit for a %d-character parent: %q", len(parentName), name+"-0")
 		}
+		if len(parentName) <= 52 && name != parentName+"-postgres" {
+			t.Fatalf("existing valid database identity changed: %q", name)
+		}
+		got := provisionManagedDatabase(t, req)
 		databaseChild(t, got, "Service", name)
+		sts := databaseChild(t, got, "StatefulSet", name)
+		if object(sts["spec"])["serviceName"] != name {
+			t.Fatal("StatefulSet must use the same shortened headless Service name")
+		}
 		customize, err := Customize(req.Parent)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, rule := range customize.RelatedResources {
-			if rule.Resource == "persistentvolumeclaims" && !reflect.DeepEqual(rule.Names, []string{"data-" + name + "-0"}) {
-				t.Fatal("retained PVC watch disagrees with the shortened database name")
+			if rule.Resource == "persistentvolumeclaims" {
+				found := false
+				for _, watched := range rule.Names {
+					found = found || watched == "data-"+name+"-0"
+				}
+				if !found {
+					t.Fatal("retained PVC watch disagrees with the shortened database name")
+				}
 			}
 		}
 	}

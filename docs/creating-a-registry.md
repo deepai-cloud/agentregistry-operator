@@ -207,3 +207,11 @@ Choose a new registry name and preferably a separate tenant namespace. Supply a
 new authentication Secret and optional hostname. Each managed registry gets its
 own PostgreSQL instance, credentials and volume. For external mode, also provide
 an independent database, role and correctly labeled database pods.
+
+In a shared namespace, registry names must also avoid each other's generated
+resource names. For example, a managed `catalog` creates a Service and
+NetworkPolicy named `catalog-postgres`, so another registry named
+`catalog-postgres` cannot share that namespace. Use a different name or namespace,
+and reserve each registry's [generated names](api-reference.md#resource-identity)
+before creating it. Admission validates name syntax but does not detect these
+cross-registry collisions.

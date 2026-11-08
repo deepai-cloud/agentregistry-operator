@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import tempfile
 
 
 def main():
@@ -17,7 +18,7 @@ def main():
     directory = Path(args.output_dir)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     paths = [directory / "secrets.json", directory / "credentials.txt", directory / "curl.conf"]
-    if any(path.exists() for path in paths):
+    if any(path.exists() or path.is_symlink() for path in paths):
         parser.error("credentials already exist; reuse them or select a fresh output directory")
     password = secrets.token_hex(24)
     username = "registry-admin"
@@ -47,10 +48,28 @@ def main():
     payloads = [json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}, indent=2) + "\n",
                 "Username: " + username + "\nPassword: " + password + "\n",
                 'user = "' + username + ":" + password + '"\n']
-    for path, payload in zip(paths, payloads):
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(payload)
+    # Write the complete set privately before exposing any file to demo.sh.
+    # Hard links publish without overwriting a file created since the check
+    # above. Publish secrets.json last: the demo uses it to decide to reuse.
+    with tempfile.TemporaryDirectory(dir=directory, prefix=".credentials-") as temporary:
+        staging = Path(temporary)
+        for path, payload in zip(paths, payloads):
+            descriptor = os.open(staging / path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(payload)
+        try:
+            for path in paths[1:] + paths[:1]:
+                os.link(staging / path.name, path)
+        except BaseException:
+            # Remove only this attempt's files, including on Ctrl-C. A file
+            # supplied by another writer (or a symlink) must remain untouched.
+            for path in paths:
+                try:
+                    if os.path.samestat(path.lstat(), (staging / path.name).stat()):
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
     print("Created demo credentials in " + str(directory) + "; keep these files private.")
 
 

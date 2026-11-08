@@ -3,6 +3,7 @@
   "kind": "Service",
   "metadata": {
     "name": {{ .Release.Name | quote }},
+    "annotations": {{ include "agentregistry-operator.annotations" . }},
     "labels": {{ include "agentregistry-operator.labels" . }},
     "namespace": {{ .Release.Namespace | quote }}
   },

@@ -1,6 +1,11 @@
 .DS_Store
 .git/
 .gitignore
+# Local development state must not enter installable chart archives.
+.local/
+.cache/
+__pycache__/
+*.pyc
 *.swp
 *.swo
 *~

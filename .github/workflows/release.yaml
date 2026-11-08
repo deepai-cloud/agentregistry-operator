@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.25.4'
+          go-version: '1.26.10'
           cache: false
       - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
         with:
@@ -55,8 +55,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish:
+  managed-postgres:
     needs: verify
+    uses: ./.github/workflows/managed-postgres.yaml
+
+  publish:
+    needs: [verify, managed-postgres]
     if: github.repository == 'deepai-cloud/agentregistry-operator'
     runs-on: ubuntu-24.04
     timeout-minutes: 30

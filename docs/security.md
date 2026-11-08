@@ -13,6 +13,15 @@ loopback-only application backends. It restricts API/MCP routes to catalog
 operations and rejects cross-origin browser requests. Upstream UI execution
 controls may still be visible; those operations are blocked.
 
+MCP discovery advertises only callable catalog tools and the `search_registry`
+and `registry_overview` prompts. The overview prompt describes catalog contents
+without requesting deployment information. Filtering supports JSON replies,
+streamed SSE replies and SSE replay, retaining schemas, pagination cursors and
+session headers. Discovery JSON replies and individual SSE events on discovery
+or GET streams are limited to 1 MiB. Invalid replies fail with a gateway error;
+an invalid event closes an already-started stream. Ordinary tool-call responses
+are proxied without this discovery limit.
+
 A private registry uses HTTP within its namespace. Basic authentication does not
 encrypt traffic. Enable TLS exposure when the network path requires encryption.
 Public TLS mode exposes a LoadBalancer on 443; the platform supplies certificates,
@@ -29,6 +38,13 @@ disable privilege escalation, and have no automounted Kubernetes token. They hav
 no Kubernetes RBAC. The application can write only its bounded temporary volume;
 its catalog data lives in PostgreSQL. Managed PostgreSQL also runs non-root
 without a Kubernetes token and uses its own persistent data volume.
+
+The gateway mounts only the Basic-auth username and password and, for HTTPS,
+the serving certificate and private key. The registry gets its JWT signing key
+through an environment variable. Its database mount contains the connection URL
+and, for an external database, `ca.crt` if supplied. Each mount selects its own
+keys even when multiple references point to the same Secret. Applying this change
+to an existing registry recreates its application pod once.
 
 The generated NetworkPolicy allows database TCP 5432 and cluster DNS egress.
 Managed PostgreSQL receives its own policy, allowing TCP 5432 ingress only from

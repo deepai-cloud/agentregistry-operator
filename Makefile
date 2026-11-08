@@ -10,7 +10,7 @@ export HELM ?= helm
 IMAGE ?= agentregistry-operator:dev
 VERSION ?=
 
-.PHONY: help verify test test-e2e test-k3s build chart package image demo-up demo-down clean
+.PHONY: help verify test test-e2e test-postgres-bootstrap test-registry-probes test-build-context test-k3s build chart package image demo-up demo-down clean
 .DEFAULT_GOAL := help
 
 help: ## Show available commands
@@ -20,6 +20,14 @@ verify: test build chart ## Run Go tests, vet, chart checks, and documentation c
 	@test -z "$$(gofmt -l cmd internal)" || { echo 'Run gofmt -w cmd internal'; exit 1; }
 	go vet ./...
 	python3 scripts/test-release-coordinates.py
+	python3 scripts/test-package.py
+	python3 scripts/test-demo.py
+	python3 scripts/test-create-secrets.py
+	python3 scripts/test-examples.py
+	python3 scripts/test-acceptance-http.py
+	python3 scripts/test-acceptance-secrets.py
+	python3 scripts/test-acceptance-cleanup.py
+	python3 scripts/test-bootstrap-cleanup.py
 	python3 scripts/verify-docs.py
 	python3 -m py_compile scripts/*.py examples/local/*.py
 	bash -n scripts/demo.sh
@@ -31,6 +39,18 @@ test: ## Run Go behavioral tests with the race detector
 test-e2e: ## Test managed PostgreSQL in a new disposable k3d cluster
 	@mkdir -p "$(TMPDIR)"
 	python3 scripts/test-managed-postgres.py
+
+test-postgres-bootstrap: ## Test PostgreSQL startup recovery in disposable Docker containers
+	@mkdir -p "$(TMPDIR)"
+	python3 scripts/test-postgres-bootstrap.py
+
+test-registry-probes: ## Exercise health probes inside both pinned registry images
+	@mkdir -p "$(TMPDIR)"
+	python3 scripts/test-registry-probes.py
+
+test-build-context: ## Verify Docker excludes local state and test fixtures from build sources
+	@mkdir -p "$(TMPDIR)"
+	python3 scripts/test-build-context.py
 
 test-k3s: test-e2e ## Alias for the disposable K3s acceptance test
 

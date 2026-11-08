@@ -3,6 +3,7 @@
   "kind": "ClusterRole",
   "metadata": {
     "name": {{ printf "%s-metacontroller" .Release.Name | quote }},
+    "annotations": {{ include "agentregistry-operator.annotations" . }},
     "labels": {{ include "agentregistry-operator.labels" . }}
   },
   "rules": [

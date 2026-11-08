@@ -121,6 +121,50 @@ func TestCredentialRemovalFailsClosedAndRotationRecovers(t *testing.T) {
 		t.Fatal("rotation failed")
 	}
 }
+func TestInvalidAuthenticationProjectionFailsClosed(t *testing.T) {
+	for _, invalidLink := range []bool{false, true} {
+		name := "missing revision"
+		if invalidLink {
+			name = "invalid revision link"
+		}
+		t.Run(name, func(t *testing.T) {
+			directory := credentials(t)
+			link := filepath.Join(directory, "..data")
+			var err error
+			if invalidLink {
+				err = os.WriteFile(link, []byte("not a symlink"), 0600)
+			} else {
+				err = os.Symlink("..missing", link)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("broken authentication projection reached the backend")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer up.Close()
+			g, err := New(Config{AuthDir: directory, HTTPBackend: up.URL, MCPBackend: up.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest("GET", "/", nil)
+			request.SetBasicAuth("alice", "tenant-password-long-enough")
+			response := httptest.NewRecorder()
+			g.ServeHTTP(response, request)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("broken projection must not fall back to other credential files: %d", response.Code)
+			}
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if user, _, err := g.credentials(); err != nil || user != "alice" {
+				t.Fatalf("ordinary credential files no longer work: user=%q err=%v", user, err)
+			}
+		})
+	}
+}
+
 func TestReadinessDetectsDatabaseAndMCPFailures(t *testing.T) {
 	dbOK, mcpOK := true, true
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -182,6 +226,7 @@ func TestReadinessDoesNotDependOnCatalogPayloadSize(t *testing.T) {
 			}
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"registry","version":"0.3.3"}}}`)
 	}))
 	defer up.Close()
@@ -232,6 +277,7 @@ func TestMCPProxyRewritesLoopbackHostAndPreservesSession(t *testing.T) {
 		if r.Header.Get("Mcp-Session-Id") != "session-a" {
 			t.Error("session header lost")
 		}
+		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"jsonrpc":"2.0","result":{"tools":[]},"id":2}`)
 	}))
 	defer up.Close()
@@ -298,7 +344,8 @@ func TestExpiredTLSMaterialIsNotReady(t *testing.T) {
 			io.WriteString(w, `{"servers":[]}`)
 			return
 		}
-		io.WriteString(w, `{"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"registry"}}}`)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, initializeReply)
 	}))
 	defer up.Close()
 	g, _ := New(Config{AuthDir: dir, HTTPBackend: up.URL, MCPBackend: up.URL})
@@ -372,7 +419,8 @@ func TestTLSReadinessRequiresServerCertificatePurpose(t *testing.T) {
 					io.WriteString(w, `{"servers":[]}`)
 					return
 				}
-				io.WriteString(w, `{"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"registry"}}}`)
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, initializeReply)
 			}))
 			defer up.Close()
 			g, err := New(Config{AuthDir: dir, HTTPBackend: up.URL, MCPBackend: up.URL})

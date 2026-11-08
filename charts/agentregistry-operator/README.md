@@ -10,6 +10,12 @@ Use **one release per cluster**. Kubernetes 1.30 or newer and Helm 3 are require
 A cluster administrator must install the cluster-scoped CRDs and RBAC. A CNI that
 enforces NetworkPolicy is required for the documented isolation guarantees.
 
+The Helm release name also names the webhook Service. Use a lowercase name that
+starts with a letter, contains only letters, digits and hyphens, and ends with a
+letter or digit, such as `registry-1`. Names starting with a digit or containing
+dots fail chart rendering because they are invalid Service names on the minimum
+supported Kubernetes version.
+
 ## Install
 
 Select a published version from the
@@ -75,11 +81,12 @@ covers published packages and installing on an existing cluster.
 | `metacontroller.rbac.create` | `false` | Must stay false; explicit permissions are supplied here |
 | `metacontroller.replicas` | `1` | Singleton controller; this chart does not grant leader-election permissions |
 | `metacontroller.image.tag` | `v4.17.2` | Tested bundled controller image |
-| `metacontroller.nameOverride` | `""` | Override the dependency's application name label |
-| `metacontroller.fullnameOverride` | `""` | Override the dependency's resource name |
+| `metacontroller.nameOverride` | `""` | Override the dependency's application name label; must resolve to a valid nonempty label that remains a YAML string and differs from `agentregistry-operator` |
+| `metacontroller.fullnameOverride` | `""` | Override the dependency's resource name; the resolved name must be a lowercase DNS label of at most 61 characters that remains a YAML string |
 | `metacontroller.namespaceOverride` | `""` | Must stay empty; both controllers use the Helm release namespace |
 | `metacontroller.serviceAccount.create` | `true` | Create the dependency's service account |
-| `metacontroller.serviceAccount.name` | `""` | Generated name; an explicit name is required when creation is disabled |
+| `metacontroller.serviceAccount.name` | `""` | Generated name; must be a lowercase DNS subdomain of at most 253 characters that remains a YAML string and differs from the release name; an explicit name is required when creation is disabled |
+| `metacontroller.service.enabled` | `false` | Optional controller Service; configure its ports and a resolved name starting with a letter that differs from the webhook Service |
 
 Additional upstream dependency settings, such as `metacontroller.resources`,
 `metacontroller.nodeSelector`, and `metacontroller.tolerations`, are available under
@@ -99,7 +106,53 @@ controller assumes the cluster DNS suffix `cluster.local`.
 Cross-namespace Metacontroller deployment is rejected by values validation. The
 webhook NetworkPolicy permits TCP 8080 only from the bundled controller's pods in
 the same namespace and denies webhook egress. Resource-name and service-account
-overrides remain supported.
+overrides remain supported when the resolved Metacontroller pod selectors and
+service account differ from the webhook's. Collisions fail chart rendering with
+an error identifying the override to change. This prevents the webhook's Service
+and deny-egress policy from selecting Metacontroller pods and keeps Metacontroller
+off the webhook's token-disabled service account, including when service-account
+creation is disabled.
+
+When `metacontroller.service.enabled=true`, the optional controller Service must
+also have a name starting with a letter and different from the Helm release,
+which names the webhook Service.
+The chart rejects duplicate Service names even when the service accounts differ.
+Set `metacontroller.fullnameOverride` to a distinct name or leave the optional
+Service disabled. With that Service disabled, the controller StatefulSet and
+webhook Deployment can still share a name, and a controller name starting with a
+digit remains valid.
+
+The resolved Metacontroller StatefulSet name must be a lowercase DNS label of at
+most 61 characters, leaving room for the pod's `-0` suffix within Kubernetes'
+63-character hostname limit. This applies to generated names and both naming
+overrides, after the upstream chart's truncation and trailing-hyphen trimming.
+If a long release name fails this check, set
+`--set metacontroller.fullnameOverride=registry-controller` (or another short,
+distinct name). Invalid names fail rendering before Helm can install a StatefulSet
+whose pod would be rejected by Kubernetes.
+
+The resolved application name label is checked independently, including when
+`metacontroller.fullnameOverride` is set. After truncation and trimming, it must
+start and end with a letter or digit and contain only letters, digits, hyphens,
+underscores or dots. The bundled chart emits this label without quotes, so YAML
+numbers, booleans and null values (such as `123`, `true` or `null`) are rejected
+even when supplied through `--set-string` or quoted in a values file. Choose a
+name such as `controller-1`. Uppercase letters, underscores and dots remain valid
+in the label when a separate valid `fullnameOverride` names the resources.
+The same YAML string requirement applies to the Helm release name and namespace,
+the Metacontroller resource name and its service-account name. For example, use
+`--namespace registry-system` instead of `--namespace true`.
+
+The webhook service account is named after the Helm release. Upstream naming can
+also select that name: for example, release `metacontroller-prod` needs a distinct
+controller account. Set
+`--set metacontroller.serviceAccount.name=metacontroller-prod-controller` when
+installing or upgrading that release. Choose a different `metacontroller.nameOverride`
+if its resolved name is `agentregistry-operator`.
+Controller service-account names must be lowercase DNS subdomains of at most
+253 characters, with dots and hyphens allowed inside the name. This validation
+also applies when `metacontroller.serviceAccount.create=false`: the pod must
+reference a valid account name even when Helm does not create that account.
 
 ## Verify and troubleshoot
 

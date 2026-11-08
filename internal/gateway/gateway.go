@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -47,6 +46,14 @@ func New(c Config) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
+	rewrite := mcpProxy.Rewrite
+	mcpProxy.Rewrite = func(p *httputil.ProxyRequest) {
+		rewrite(p)
+		if filterCatalogResponse(p.In) {
+			p.Out.Header.Set("Accept-Encoding", "identity")
+		}
+	}
+	mcpProxy.ModifyResponse = modifyCatalogResponse
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return &Gateway{config: c, httpProxy: httpProxy, mcpProxy: mcpProxy, client: &http.Client{Timeout: 3 * time.Second, Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
@@ -75,11 +82,24 @@ func proxy(target string) (*httputil.ReverseProxy, error) {
 	}}, nil
 }
 func (g *Gateway) credentials() (string, string, error) {
-	username, err := os.ReadFile(filepath.Join(g.config.AuthDir, "username"))
+	directory := g.config.AuthDir
+	// Kubernetes swaps ..data atomically, but opening its two visible file
+	// symlinks separately can mix revisions. Resolve the generation once per
+	// request; removal during a read fails closed, and the next request retries.
+	if revision, err := os.Readlink(filepath.Join(directory, "..data")); err == nil {
+		if filepath.IsAbs(revision) {
+			directory = revision
+		} else {
+			directory = filepath.Join(directory, revision)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", "", errors.New("credentials unavailable")
+	}
+	username, err := os.ReadFile(filepath.Join(directory, "username"))
 	if err != nil {
 		return "", "", errors.New("credentials unavailable")
 	}
-	password, err := os.ReadFile(filepath.Join(g.config.AuthDir, "password"))
+	password, err := os.ReadFile(filepath.Join(directory, "password"))
 	if err != nil || len(password) < 16 || len(username) == 0 || strings.ContainsAny(string(username), ":\r\n") {
 		return "", "", errors.New("credentials invalid")
 	}
@@ -153,6 +173,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 var catalogTools = map[string]bool{"list_agents": true, "get_agent": true, "list_servers": true, "get_server": true, "get_server_readme": true, "list_skills": true, "get_skill": true, "registry_health": true, "registry_version": true}
+var catalogPrompts = map[string]bool{"search_registry": true, "registry_overview": true}
 
 func allowMCP(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method == "GET" || r.Method == "DELETE" {
@@ -188,7 +209,7 @@ func allowMCP(w http.ResponseWriter, r *http.Request) bool {
 	case "tools/call":
 		allowed = catalogTools[name]
 	case "prompts/get":
-		allowed = name == "search_registry" || name == "registry_overview"
+		allowed = catalogPrompts[name]
 	}
 	if !allowed {
 		http.Error(w, "MCP operation outside registry catalog scope", 403)
@@ -201,6 +222,9 @@ func allowMCP(w http.ResponseWriter, r *http.Request) bool {
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
+	if method == "tools/list" || method == "prompts/list" || (method == "prompts/get" && name == "registry_overview") {
+		*r = *r.WithContext(context.WithValue(r.Context(), catalogResponseKey{}, true))
+	}
 	return true
 }
 
@@ -251,46 +275,41 @@ func (g *Gateway) mcpReady(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if id := resp.Header.Get("Mcp-Session-Id"); id != "" {
-		defer func() {
+	protocolVersion := "2025-06-18"
+	defer func() {
+		resp.Body.Close()
+		if id := resp.Header.Get("Mcp-Session-Id"); id != "" {
 			cleanup, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			del, _ := http.NewRequestWithContext(cleanup, "DELETE", g.config.MCPBackend+"/mcp", nil)
 			del.Header.Set("Mcp-Session-Id", id)
-			del.Header.Set("MCP-Protocol-Version", "2025-06-18")
+			del.Header.Set("MCP-Protocol-Version", protocolVersion)
 			if result, e := g.client.Do(del); e == nil {
 				result.Body.Close()
 			}
-		}()
-	}
+		}
+	}()
 	if resp.StatusCode != 200 {
 		return errors.New("MCP initialize failed")
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	data, err := readMCPInitialization(resp)
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		var frames []byte
-		for _, line := range bytes.Split(data, []byte("\n")) {
-			if bytes.HasPrefix(line, []byte("data:")) {
-				frames = append(frames, bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))...)
-				frames = append(frames, '\n')
-			}
-		}
-		data = frames
-	}
 	var reply struct {
-		Result struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Result  struct {
 			ProtocolVersion string         `json:"protocolVersion"`
 			ServerInfo      map[string]any `json:"serverInfo"`
 		} `json:"result"`
 		Error json.RawMessage `json:"error"`
 	}
-	if json.Unmarshal(data, &reply) != nil || reply.Result.ProtocolVersion == "" || len(reply.Result.ServerInfo) == 0 || len(reply.Error) > 0 {
+	if json.Unmarshal(data, &reply) != nil || reply.JSONRPC != "2.0" || string(reply.ID) != "1" || reply.Method != "" || reply.Result.ProtocolVersion == "" || len(reply.Result.ServerInfo) == 0 || len(reply.Error) > 0 {
 		return errors.New("invalid MCP initialization response")
 	}
+	protocolVersion = reply.Result.ProtocolVersion
 	return nil
 }
 
@@ -300,7 +319,7 @@ func servingCertificateReady() error {
 	if certFile == "" && keyFile == "" {
 		return nil
 	}
-	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	pair, err := certificates.LoadKeyPair(certFile, keyFile)
 	if err != nil {
 		return err
 	}
